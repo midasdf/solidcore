@@ -1035,7 +1035,7 @@ mod tests {
         let cases = all();
         assert_eq!(
             cases.len(),
-            44,
+            47,
             "{:?}",
             cases.iter().map(|c| &c.id).collect::<Vec<_>>()
         );
