@@ -1258,6 +1258,19 @@ impl solidcore::topology::proto_topology::p3::BrepGlue<H> for Two {
         v2: H,
         opt_wire_edges_in_brep: Option<&[H]>,
     ) -> solidcore::Result<()> {
+        if brep.kind == K_BREP
+            && v1.kind == K_VERTEX
+            && v2.kind == K_VERTEX
+            && v1.b != v2.b
+            && (v1.b == brep.b || v2.b == brep.b)
+        {
+            // UNPORTED(topology.brep_p5): SmBrep::GlueVertices of vertices of two B-reps --
+            // justified: topology::brep::p5::glue_vertices takes one B-rep arena
+            return Err(SolidError::unported(
+                "SmBrep::GlueVertices (vertices of two B-reps)",
+                "topology.brep_p5",
+            ));
+        }
         if brep.kind != K_BREP
             || v1.kind != K_VERTEX
             || v2.kind != K_VERTEX
@@ -1295,6 +1308,9 @@ impl solidcore::topology::proto_topology::p3::BrepGlue<H> for Two {
             Some(vid(v2)),
             wires.as_deref(),
         )
+    }
+    fn delete_edge(&mut self, k: &mut Kernel, brep: H, edge: H) -> solidcore::Result<()> {
+        IntersectorBrep::brep_delete_edge(self, k, brep, edge)
     }
 }
 
@@ -1731,6 +1747,26 @@ impl IntersectorBrep<H> for Two {
             .map(drop)
         })
     }
+    fn brep_delete_edge(&mut self, k: &mut Kernel, brep: H, edge: H) -> solidcore::Result<()> {
+        if brep.kind != K_BREP || edge.kind != K_EDGE || edge.b != brep.b {
+            return Err(invalid("edge is not in the B-rep"));
+        }
+        let b = self.brep_m(brep)?;
+        with_edit_env(b, |b, env| {
+            let mut delete = solidcore::topology::brep::p4::DeleteEnv::from_notify(env);
+            solidcore::topology::brep::p4::delete_edge(k, b, &mut delete, eid(edge), None)
+        })
+    }
+    fn brep_delete_vertex(&mut self, k: &mut Kernel, brep: H, vertex: H) -> solidcore::Result<()> {
+        if brep.kind != K_BREP || vertex.kind != K_VERTEX || vertex.b != brep.b {
+            return Err(invalid("vertex is not in the B-rep"));
+        }
+        let b = self.brep_m(brep)?;
+        with_edit_env(b, |b, env| {
+            let mut delete = solidcore::topology::brep::p4::DeleteEnv::from_notify(env);
+            solidcore::topology::brep::p4::delete_vertex(k, b, &mut delete, vid(vertex))
+        })
+    }
 
     fn brep_glue_edges_general(
         &mut self,
@@ -1938,6 +1974,9 @@ impl TopologyObjects<H> for Two {
     fn edge_interval(&self, edge: H) -> solidcore::Result<Extent1d> {
         ed::interval(self.brep_r(edge)?, eid(edge))
     }
+    fn edge_tolerance(&self, edge: H) -> solidcore::Result<f64> {
+        ed::tolerance(self.brep_r(edge)?, eid(edge))
+    }
     fn surface_face(&self, surface: H) -> solidcore::Result<Option<H>> {
         Ok((surface.kind == K_FACE_SURFACE).then_some(hd(surface.b, K_FACE, surface.i)))
     }
@@ -1954,6 +1993,12 @@ impl TopologyObjects<H> for Two {
     }
     fn face_tolerance(&self, face: H) -> solidcore::Result<f64> {
         fp2::tolerance(self.brep_r(face)?, fid(face))
+    }
+    fn face_entity(&self, face: H) -> Option<(&Brep, FaceId)> {
+        if face.kind != K_FACE {
+            return None;
+        }
+        Some((self.brep_r(face).ok()?, fid(face)))
     }
     fn surface_owner(&self, surface: H) -> solidcore::Result<Option<H>> {
         self.surface_face(surface)

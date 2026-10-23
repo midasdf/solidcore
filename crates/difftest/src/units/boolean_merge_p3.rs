@@ -840,12 +840,11 @@ impl PiecewiseAccess for Pool {
 }
 
 fn destroy_brep(
-    _k: &mut Kernel,
-    _brep: &mut Brep,
+    k: &mut Kernel,
+    brep: &mut Brep,
     _attributes: &mut AttributeStore,
 ) -> solidcore::Result<()> {
-    // UNPORTED(topology.brep_p4): SmBrep::~SmBrep
-    Err(SolidError::unported("SmBrep::~SmBrep", "topology.brep_p4"))
+    solidcore::topology::brep::p4::destroy(k, brep)
 }
 
 /// `new SmBrep(dSize, dRatio, pOptContextForStack)`
@@ -1150,6 +1149,37 @@ mod tests {
         ffi::eval(&encode(&input)).unwrap()
     }
 
+    /// Both engines must complete each nested fixture with its expected vertex count.
+    #[cfg(feature = "cpp")]
+    #[test]
+    fn nested_postfix_fixtures_compare_successful_geometry() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/boolean.merge_p3/nested_postfix.json"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let fixtures: Value = serde_json::from_str(&text).unwrap();
+        for fixture in fixtures["cases"].as_array().unwrap() {
+            let input: Inputs = serde_json::from_value(fixture["inputs"].clone()).unwrap();
+            let expected_vertices = fixture["expected_vertices"].as_i64().unwrap();
+            let native = native_output(&ffi::eval(&encode(&input)).unwrap(), input.family).unwrap();
+            for result in [rust(&input).unwrap(), native] {
+                assert!(result.error.is_none(), "{}: {:?}", fixture["name"], result.error);
+                assert!(result.deferred.is_none(), "{}: {:?}", fixture["name"], result.deferred);
+                assert!(result.rejected.is_none(), "{}: {:?}", fixture["name"], result.rejected);
+                assert_eq!(result.ints["status"], [0], "{}", fixture["name"]);
+                let vertices: i64 = result.ints["topology_counts"]
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(|counts| counts[2].max(0))
+                    .sum();
+                assert_eq!(vertices, expected_vertices, "{}", fixture["name"]);
+                assert!(!result.values["record"].is_empty(), "{}", fixture["name"]);
+            }
+        }
+    }
+
     #[test]
     fn single_success_records_compare_rust_geometry_controls_and_nulls() {
         let mut pool = Pool::load(&inputs()).unwrap();
@@ -1282,13 +1312,9 @@ mod tests {
         // completion on the fixture
         let r = pool.process_wires(&mut k, &MarkLock::unbound());
         assert!(r.is_ok(), "process_wires: {r:?}");
-        assert!(matches!(
-            pool.delete_other(&mut k),
-            Err(SolidError::Unported {
-                unit: "topology.brep_p4",
-                ..
-            })
-        ));
-        assert_eq!(pool.other, Some(1)); // an unported destructor consumes nothing
+        // ~SmBrep is topology.brep_p4's: the other operand is destroyed and released
+        let r = pool.delete_other(&mut k);
+        assert!(r.is_ok(), "delete_other: {r:?}");
+        assert_eq!(pool.other, None);
     }
 }

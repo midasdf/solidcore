@@ -45,7 +45,11 @@
 //!   [`SolidError::InvalidInput`].
 //! - **`CreateUVTrimCurves`** takes the optional UV curves and their orientations as one
 //!   argument (upstream requires both or neither). The surface owner is cleared and
-//!   restored around the walk ([`face2::RescueSurfaceOwner`]), also on errors. A chosen
+//!   restored around the walk ([`face2::RescueSurfaceOwner`]), also on errors, and the
+//!   scope is recorded on the B-rep ([`Brep::begin_surface_owner_cleared`]): a nested
+//!   `smsurf_GetSurfaceCache` of the face's surface (an edge use's `EvaluateBinormal`)
+//!   then builds no face trim and does not create the face's UV trim curves itself,
+//!   as upstream, whose surface has no face meanwhile. A chosen
 //!   candidate curve is moved out of its slot; unused candidates stay with the caller
 //!   (upstream deletes them).
 //! - **`FaceIntersect`** returns its outputs in [`FaceIntersection`] (the optional ones
@@ -788,8 +792,12 @@ pub fn create_uv_trim_curves(
     if let Some(s) = b.face_mut(f)?.surface.as_mut() {
         s.set_owner(None);
     }
+    // (recorded on the B-rep: a nested `smsurf_GetSurfaceCache` of the face's surface
+    // then finds no face, so it does not build the face's UV trim curves itself)
+    b.begin_surface_owner_cleared(f);
     let result = create_uv_trim_curves_body(k, b, f, adjust_tolerances, opt_uv_curves, &pre);
     // SmRescueSurfaceOwner's destructor restores the owner on every return
+    b.end_surface_owner_cleared(f);
     if let Some(s) = b.face_mut(f)?.surface.as_mut() {
         rescue.restore(s);
     }
@@ -1021,6 +1029,14 @@ impl ClassGeometry<EntityRef> for EdgeGeometry<'_> {
             EntityRef::Vertex(v) => Some(self.b.vertex(v).ok()?.point),
             _ => None,
         }
+    }
+    // the handles are the face's B-rep entities: the topology members
+    // (`SmEdge::GetTolerance`, ...) read them there
+    fn topology_entity(&self, o: EntityRef) -> Option<(&Brep, EntityRef)> {
+        Some((self.b, o))
+    }
+    fn topology_handle(&self, e: EntityRef) -> Option<EntityRef> {
+        Some(e)
     }
 }
 
@@ -1375,12 +1391,17 @@ pub struct FaceIntersection {
     pub cc_other_uv_curves: Option<Vec<Option<Curve>>>,
 }
 
-/// The classification objects of [`face_intersect`].
-struct IntersectObjects<'a> {
-    b: &'a Brep,
-    curves_3d: &'a [Curve],
-    uv1: &'a [Option<Curve>],
-    uv2: &'a [Option<Curve>],
+/// The classification objects of [`face_intersect`] (also used by
+/// `topology::brep::p7`'s `MergeSelfIntersectionCurves`).
+pub(crate) struct IntersectObjects<'a> {
+    /// The B-rep of the faces.
+    pub(crate) b: &'a Brep,
+    /// The curves behind [`IntersectObject::Curve`].
+    pub(crate) curves_3d: &'a [Curve],
+    /// The curves behind [`IntersectObject::UvCurve`] `(i, false)`.
+    pub(crate) uv1: &'a [Option<Curve>],
+    /// The curves behind [`IntersectObject::UvCurve`] `(i, true)`.
+    pub(crate) uv2: &'a [Option<Curve>],
 }
 
 impl qf2::CurveOnClassifyObjects<IntersectObject> for IntersectObjects<'_> {

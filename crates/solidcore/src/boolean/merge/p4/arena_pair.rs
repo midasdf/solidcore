@@ -1064,6 +1064,30 @@ impl IntersectorBrep<H> for ArenaPair<'_> {
             .map(drop)
         })
     }
+
+    /// `SmBrep::DeleteEdge(pEdge)` (`pOptSurfaceToKeep = NULL`):
+    /// [`crate::topology::brep::p4::delete_edge`], notifying as the face deletion does.
+    fn brep_delete_edge(&mut self, k: &mut Kernel, brep: H, edge: H) -> crate::Result<()> {
+        if brep.kind != K_BREP || edge.kind != K_EDGE || edge.b != brep.b {
+            return Err(invalid("edge is not in the B-rep"));
+        }
+        self.with_edit_env(brep, |b, env| {
+            let mut delete = crate::topology::brep::p4::DeleteEnv::from_notify(env);
+            crate::topology::brep::p4::delete_edge(k, b, &mut delete, eid(edge), None)
+        })
+    }
+
+    /// `SmBrep::DeleteVertex(pVertex)`: [`crate::topology::brep::p4::delete_vertex`],
+    /// notifying as the face deletion does.
+    fn brep_delete_vertex(&mut self, k: &mut Kernel, brep: H, vertex: H) -> crate::Result<()> {
+        if brep.kind != K_BREP || vertex.kind != K_VERTEX || vertex.b != brep.b {
+            return Err(invalid("vertex is not in the B-rep"));
+        }
+        self.with_edit_env(brep, |b, env| {
+            let mut delete = crate::topology::brep::p4::DeleteEnv::from_notify(env);
+            crate::topology::brep::p4::delete_vertex(k, b, &mut delete, vid(vertex))
+        })
+    }
 }
 
 impl ArenaPair<'_> {
@@ -1187,6 +1211,9 @@ impl TopologyObjects<H> for ArenaPair<'_> {
     fn edge_interval(&self, edge: H) -> crate::Result<Extent1d> {
         ed::interval(self.brep_r(edge)?, eid(edge))
     }
+    fn edge_tolerance(&self, edge: H) -> crate::Result<f64> {
+        ed::tolerance(self.brep_r(edge)?, eid(edge))
+    }
     fn surface_face(&self, surface: H) -> crate::Result<Option<H>> {
         Ok((surface.kind == K_FACE_SURFACE).then_some(hd(surface.b, K_FACE, surface.i)))
     }
@@ -1203,6 +1230,12 @@ impl TopologyObjects<H> for ArenaPair<'_> {
     }
     fn face_tolerance(&self, face: H) -> crate::Result<f64> {
         fp2::tolerance(self.brep_r(face)?, fid(face))
+    }
+    fn face_entity(&self, face: H) -> Option<(&Brep, FaceId)> {
+        if face.kind != K_FACE {
+            return None;
+        }
+        Some((self.brep_r(face).ok()?, fid(face)))
     }
     fn surface_owner(&self, surface: H) -> crate::Result<Option<H>> {
         self.surface_face(surface)
@@ -1353,6 +1386,11 @@ impl crate::topology::proto_topology::p3::BrepGlue<H> for ArenaPair<'_> {
             wires.as_deref(),
             Some(&mut notify),
         )
+    }
+
+    /// `SmBrep::DeleteEdge` of `brep`, as [`IntersectorBrep::brep_delete_edge`].
+    fn delete_edge(&mut self, k: &mut Kernel, brep: H, edge: H) -> crate::Result<()> {
+        IntersectorBrep::brep_delete_edge(self, k, brep, edge)
     }
 }
 

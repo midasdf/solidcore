@@ -319,7 +319,17 @@ impl SurfOfRevolution {
         rotate_n_move: &Axis2Placement,
         scale: Option<Vec3>,
     ) -> Result<()> {
-        self.transform_using(k, rotate_n_move, scale, &Self::own_sweep_iso)
+        self.transform_at_depth(k, rotate_n_move, scale, 0)
+    }
+
+    pub(crate) fn transform_at_depth(
+        &mut self,
+        k: &Kernel,
+        rotate_n_move: &Axis2Placement,
+        scale: Option<Vec3>,
+        depth: usize,
+    ) -> Result<()> {
+        self.transform_using_at_depth(k, rotate_n_move, scale, &Self::own_sweep_iso, depth)
     }
 
     /// [`Self::transform`] with the polar converter rebuilt from the sweep iso curves
@@ -331,6 +341,17 @@ impl SurfOfRevolution {
         rotate_n_move: &Axis2Placement,
         scale: Option<Vec3>,
         iso: SweepIsoFn<'_>,
+    ) -> Result<()> {
+        self.transform_using_at_depth(k, rotate_n_move, scale, iso, 0)
+    }
+
+    fn transform_using_at_depth(
+        &mut self,
+        k: &Kernel,
+        rotate_n_move: &Axis2Placement,
+        scale: Option<Vec3>,
+        iso: SweepIsoFn<'_>,
+        depth: usize,
     ) -> Result<()> {
         let identity_scale = Vec3::new(1.0, 1.0, 1.0);
 
@@ -365,7 +386,7 @@ impl SurfOfRevolution {
             .gen_curve
             .as_mut()
             .ok_or(SolidError::null_pointer(OP_GEN))?;
-        ignore_status(gen.transform(k, rotate_n_move, scale))?;
+        ignore_status(gen.transform_at_depth(k, rotate_n_move, scale, depth + 1))?;
 
         // apply transformation to underlying Nurb
         if self.base.nurb.is_some() {
@@ -568,6 +589,7 @@ impl SurfOfRevolution {
             requested,
             this,
             &|k, uv| self.evaluate_step_point(k, uv),
+            &|_, uv| self.base.evaluate_point(uv),
             &|k, domain, operation, point, guess| {
                 surface_local_point_solve(k, self, domain, operation, point, guess)
             },
@@ -575,9 +597,9 @@ impl SurfOfRevolution {
     }
 
     /// [`Self::drop_point_fast`] with upstream's virtual calls on `this` supplied by
-    /// the derived class (`SmSphere`, `SmTorus`): `step_point` is its
-    /// `EvaluateSTEPPoint` and `local_solve` its `LocalPointSolve` (`found` and the
-    /// solution).
+    /// the derived class (`SmCone`, `SmSphere`, `SmTorus`): `step_point` is its
+    /// `EvaluateSTEPPoint`, `evaluate_point` its `EvaluatePoint`, and `local_solve`
+    /// its `LocalPointSolve` (`found` and the solution).
     ///
     /// # Errors
     ///
@@ -596,6 +618,7 @@ impl SurfOfRevolution {
         requested: SolutionRequested,
         this: Option<O>,
         step_point: &dyn Fn(&Kernel, Point2) -> Result<Point3>,
+        evaluate_point: &dyn Fn(&Kernel, Point2) -> Result<Point3>,
         local_solve: &dyn Fn(
             &Kernel,
             &Extent2d,
@@ -676,6 +699,7 @@ impl SurfOfRevolution {
             opt_vectors: None,
             handle: Some(gen_handle),
             analytic_handle: Some(GenHandle(2, gen_handle.1)),
+            zone_tol_3d: None,
         };
         let gen_solutions = gen.global_point_solve(
             k,
@@ -793,7 +817,7 @@ impl SurfOfRevolution {
                 }
 
                 // set SolutionValue = dropSurfacePoint to TestPoint distance
-                let surf_pnt = self.base.evaluate_point(uv)?;
+                let surf_pnt = evaluate_point(k, uv)?;
                 sol.start.solution_value = test_point.distance(surf_pnt);
 
                 // skip intersection solutions whose value exceed the DistanceTolerance

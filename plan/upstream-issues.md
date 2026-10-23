@@ -1068,12 +1068,12 @@ meantime, whoever merges renumbers the new entry and every reference to it (here
 
 #### UB-87. `SmCone::CreateIsoCircleFromPoint` and `GetHeight` read uninitialised parameters
 - **Location:** `SmCone.cpp:1679`-`1682` `SmCone::CreateIsoCircleFromPoint` (def. `:1620`); `SmCone.cpp:2265`-`2266` `SmCone::GetHeight` (def. `:2251`).
-- **What happens:** `CreateIsoCircleFromPoint` ignores the statuses of `STEPInversion` and `ConvertUVFromSTEPToNURBS`; when the generator drop in `SmSurfOfRevolution::STEPInversion` finds no solution the height of `sStepUV` is never written and is used anyway. `GetHeight` ignores `EvaluatePoint`'s status and subtracts uninitialised points when the conversion fails (no polar curve).
+- **What happens:** `CreateIsoCircleFromPoint` ignores the statuses of `STEPInversion` and `ConvertUVFromSTEPToNURBS`; when the generator drop in `SmSurfOfRevolution::STEPInversion` finds no solution the height of `sStepUV` is never written and is used anyway. `GetHeight` also ignores `EvaluatePoint`'s status when the conversion fails (no polar curve), but that part is defined: the `SmPoint3d` outputs keep their `SM_UNDEF_DOUBLE` member initialisers, so two failures give height `0` (PR #226, issue #277).
 - **Trigger:** `CreateIsoCircleFromPoint` with a reference point just outside the height interval of a steep bounded cone and a tolerance below the in-plane gap the clamp leaves; `CreateIsoCircleFromPoint` on `SmCone::CreateCanonical(O, 1, 5e-11 deg, NULL)` (no `bSwapUV`) at `(-1, 1e-13, 0.7)`, where the polar conversion fails and `sNurbUV.y` (a defaulted `SmVector2d`) is used unset; `GetHeight` of the cone of UB-81.
 - **How found:** read during porting (`surface.cone_p1`).
 - **Confirmed:** no. The shim replays the inversion and refuses those inputs.
 - **Severity:** crash/UB (uninitialised read).
-- **Rust port:** Returns the error.
+- **Rust port:** `CreateIsoCircleFromPoint` returns the error. `Cone::height` mirrors `GetHeight` (failed evaluations keep `Vec3::UNDEF`), and the `surface.cone_p2` difftest compares it, and the offset and trim ops that use it, on cones without a polar curve (`fixtures/surface.cone_p2/no_polar_curve.json`).
 
 #### UB-88. `SmCone` STEP-to-NURB conversion dereferences a missing polar curve
 - **Location:** `source/SMLib/src/SmEllipse.cpp:489`, `SmPolarConversion::ConvertToNURBSParameter` (def. `:467`), reached from `SmCone.cpp:1808` `SmCone::ConvertUVFromSTEPToNURBS` and `:1682` `SmCone::CreateIsoCircleFromPoint`.
@@ -1426,6 +1426,15 @@ meantime, whoever merges renumbers the new entry and every reference to it (here
 - **Severity:** crash/UB (needs a bad argument from the calling code).
 - **Rust port:** `heal::gap` returns `InvalidInput`.
 
+#### UB-129. `SmSurface::DropCurve` uses results whose status it ignores
+- **Location:** `source/SMLib/src/SmSurfaceDropLib.cpp:4590`-`4591` (`SmBSplineCurve::CreateLineSegment` of the pole line, status ignored, then `pUVTrimCurve->EditParameterization` on the pointer that stays `NULL` on a failure), `:5489` (`p3dCurve->EvaluatePoint(sInterval.GetMax(), sCurveEnd)`, status ignored, then `sCurveEnd` read), `:4232` (`SmTol::GetScaledZero(cr3dCurve)`, `SmTol.cpp:1400`, reads the point of an ignored `EvaluatePoint`) and `:4233` (`cr3dCurve.IsDegenerate(.., &crInterval)`, `SmCurve.cpp:14395`-`14427`: it reads the derivatives of `Evaluate` calls whose statuses it ignores; its asserted precondition, `crInterval` inside the natural interval, is compiled out and only matters for a curve kind whose `Evaluate` fails outside that interval).
+- **What happens:** A failing callee leaves the output unset (a `NULL` curve pointer, an uninitialised point or derivative array) and the next statement uses it.
+- **Trigger:** `CreateLineSegment` fails only for coincident ends (a natural domain shorter than `SM_EFF_ZERO` in the pole direction, which the domain checks above nearly exclude); the `EvaluatePoint`s fail only for curve kinds whose point evaluation can fail (`SmBSplineCurve`, `SmLine` and `SmCircle` clamp or extend instead); the `:4233` `IsDegenerate` case needs a curve kind whose `Evaluate` fails outside its natural interval, and `crInterval` reaching outside it (none in the harness: `SmBSplineCurve::Evaluate`/`EvaluatePoint` clamp, `SmBSplineCurve.cpp:3056`, `:3307`, and `SmLine` and `SmCircle` evaluate anywhere, so those intervals are not undefined).
+- **How found:** read during porting.
+- **Confirmed:** no.
+- **Severity:** crash/UB (needs a bad argument or a failing evaluator).
+- **Rust port:** `Surface::drop_curve_base` propagates those errors. The FFI rejects nothing for the `IsDegenerate` case (it accepts intervals outside the curve's range, zero-length and inverted ones; probed).
+
 #### UB-155. Volume discontinuity W planes index the V parameter array
 - **Location:** `source/SMLib/src/SmCurveClass.cpp:10071-10072`, `SmCurveClassification::Intersect3DDiscontinuities` (volume).
 - **What happens:** The W-plane loop takes its coordinates from `m_sParamsV[kk]` while iterating `m_sParamsW`. Different V/W values put the planes at the wrong W positions; more W than V parameters reads past V's array.
@@ -1501,6 +1510,15 @@ meantime, whoever merges renumbers the new entry and every reference to it (here
 - **Confirmed:** no (the difftest wrapper never passes NULL curves).
 - **Severity:** crash.
 - **Rust port:** takes a slice of curves (no NULL entries).
+
+#### UB-210. `SmBrep::DeleteEdge` reads `pSurvF` outside the merge branch that sets it (unreachable on well-formed topology)
+- **Location:** `source/SMLib/src/SmBrep.cpp:6043` (`pOptSurfaceToKeep != pSurvF->GetSurface()`) and `:6046` (`pDelF->GetSurface()`) in `SmBrep::DeleteEdge` (def. `:5752`); `pSurvF`/`pDelF` are set only inside `if(bMergeFace)` (`:5911`), while the surface-swap block's guard (`:6037-6039`) is only `!bSplitLoop && !(both loops inner)`.
+- **What happens:** The two guards differ by the strut test (`bMergeFace = !bSplitLoop && !bVIsStrut && !bVRadIsStrut && !bothInner`). If an end of the edge were a strut end without a split loop, a non-NULL `pOptSurfaceToKeep` would dereference the NULL `pSurvF`.
+- **Reachability:** none on well-formed topology. `SmEdgeuse::IsStrut` (`SmEdgeuse.cpp:294-301`) is `GetRadial() == m_pCW`, and `m_pCW` is in the edge use's own loop use. `pEURad = pEU->GetRadial()`, so `pEU->IsStrut()` puts `pEURad` in `pLU`, i.e. `pLURad == pLU` (`bSplitLoop`). For a manifold edge the edge-use list alternates orientations (`GetRadial`, `SmEdgeuse.cpp:3561-3578`, is the previous use for a use oriented like the primary, the next one otherwise), so `pEURad->GetRadial() == pEU` and `pEURad->IsStrut()` likewise implies `bSplitLoop`. Hence `!bSplitLoop` forces both strut flags false, and with `!bothInner` that is `bMergeFace`: `pSurvF` is set (and `NER`-checked). Only an edge-use list whose orientations do not alternate could reach it.
+- **How found:** read during porting (unit `topology.brep_p4`).
+- **Confirmed:** no; unreachable by the argument above (no fixture B-rep has a non-alternating manifold edge-use list).
+- **Severity:** crash (theoretical; malformed topology only).
+- **Rust port:** `topology::brep::p4::delete_manifold_edge` keeps a defensive `SolidError::InvalidInput` there (code comment cites UB-210).
 #### UB-157. `CreateBlendSurface` with rails of different natural intervals writes past `sIntParams`
 - **Location:** `SmBSplineSurfaceNLib.cpp:5305`-`5378` (`SmBSplineSurface::CreateSkinnedSurface`, reads `sIntParams[lNumSections+ii]` at `:5366` and writes it at `:5378`); reached from `SmSurface::CreateBlendSurface` (`SmSurface.cpp:15375`, via `SmDerivSurfDefinition::SkinDerivSurface`, `:3503`), which passes only one parameter per cross section (`sParams`, 101 values). `CreateBlendSurface` also ignores the statuses of both `GetSampleValues` calls (`SmSurface.cpp:15443`, `:15452`) and goes on with partly filled sample arrays.
 - **What happens:** With two rails, `CreateSkinnedSurface` expects `2 * lNumSections` intersection parameters. When `SyncronizeKnotsOfCurves` changes the natural interval of rail 2, the loop reads and writes past the end of the `SmTArray` copy: heap corruption.
@@ -1937,6 +1955,16 @@ meantime, whoever merges renumbers the new entry and every reference to it (here
 - **Severity:** crash/UB (null dereference). A crafted file with an old healer version reaches it through `ReadFromFile`.
 - **Rust port:** not reached; the `topology.brep_p10` runner rejects healing requests on such data (`crates/difftest/src/units/topology_brep_p10.rs:182` `heal_guard`).
 
+#### UB-252. A variable radius law that cannot be evaluated: `SetupOffsetValues` and `SmTemporaryRadiusChange::SetUp` read its unset output
+- **Location:** `source/SMLib/src/SmFilletStandardSolver.cpp:2414-2434` `SmVariableRadiusFS::SetupOffsetValues`: `m_rLaw->Evaluate` (`:2420`) is called without checking its status, and `dValues[0]` goes into `*pdOffsetDist` (`:2428`) and both offset surfaces' distances (`:2429-2430`) whatever happened. `source/SMLib/src/SmFilletExecutive.cpp:5036-5037` `SmTemporaryRadiusChange::SetUp`: `pLaw->Evaluate(dEdgeT, sEdgeIvl, bRev, adValues)` unchecked, then `dEndRad = adValues[0]` builds the temporary constant law (`:5042-5043`, `:5067-5068`). `source/SMLib/src/SmFilletSolver.cpp:5254` and `:5321` `SmFilletSolver::StepSolve` ignore the status of `SetupOffsetValues`, which the function never reports (it returns `SM_SUCCESS` unconditionally). The other users of the law (`SmFilletStandardSolver.cpp:2075`, `:2539`) do check.
+- **What happens:** `SmBSplineFilletLaw::Evaluate` fails where the law is evaluated past the fillet edge's ends and its curve cannot be extended, and leaves the output array unset. The unset `dValues[0]` (a radius of -3e-314 under the debugger, tangency-labs/solidcore#458) then becomes the offset distance of both offset surfaces, or the radius of the temporary constant law.
+- **Trigger:** a variable round (`SM_FS_VARIABLE_RADIUS`) whose `SmBSplineFilletLaw` curve has zero speed, a constant law laid out as the radius in x and 0 in y (`SmBSplineCurve::CreateExtendedCurve` refuses it), on a cube edge or running into an R5 corner; the law the C API shim of tangency-labs/smlib built before 3759189 (found on tangency-labs/smlib#421).
+- **How found:** issue #458, read at `c9c5979`.
+- **Confirmed:** no (the maintainer saw the unset radius under the debugger; ASan/UBSan do not see an uninitialised read, and the round then fails with 1001 further on; no C++ run here).
+- **Severity:** crash/UB (an uninitialised read).
+- **Fix:** tangency-labs/smlib@9a12ad7 returns the failed evaluation from both (`SetUp` before it changes anything) and checks `SetupOffsetValues` in `StepSolve`.
+- **Rust port:** `VariableRadiusFs::setup_offset_values` (`crates/solidcore/src/blend/fillet_standard_solver/p1.rs`) and `TemporaryRadiusChange::set_up` (`crates/solidcore/src/blend/fillet_executive/p2.rs`) already return the law evaluation's failure, `set_up` before it changes anything. `FilletSolver::step_solve` (`fillet_solver/p3.rs`) dropped the first one's failure with `ignore_status` and went on with the offsets as they were; it now returns it, as the fork's does (test `step_solve_returns_a_failed_setup_of_the_offsets`). Upstream defines nothing for that state, and its `SetupOffsetValues` never fails, so no result the difftest compares changes. The second `StepSolve` call (`:5321`) is behind the variable-radius branch that `step_solve` still defers (`GetOriginalCurve`, unit `blend.fillet_standard_solver_p1`); it must check the status when that branch is ported.
+
 ### Healer target management
 
 #### HANG-32. `SmBrep::CreateParallelProjectionCurves` spins on a subnormal approximation tolerance
@@ -1973,6 +2001,16 @@ meantime, whoever merges renumbers the new entry and every reference to it (here
 - **How found:** crash in the C++ reference run during the maintainer's step-33 sequence fuzzing ([PR #164, round 2](https://github.com/tangency-labs/solidcore/pull/164#pullrequestreview-5554396459)); source inspection confirmed the mismatched list sizes and resize boundary.
 - **Confirmed:** yes by that reference run: 31 crashing scripts (7 coincidence-cache, 21 harness reads of NULL props, 3 degeneracy-cache). Requires inconsistent caller-controlled healer state; ordinary end-to-end healing was not the trigger.
 - **Severity:** crash/UB.
+
+#### UB-182. Building the surface cache of a B-spline surface with a near-zero first v knot span crashes [PSIRT]
+- **Location:** `source/SMLib/src/SmNurbsSrf.cpp:1524` `sm_DecomposeSrf` (the v-direction patch loop from `:1665`; the u loop has the `iq >= nsu` quit at `:1653`, the v loop has no counterpart), reached through `SmSurfaceCache::BuildTreeBase` (`SmSurfaceCache.cpp:5042`, `sm_CreateBezierPatchBlock`) from `SmSurface::DropCurve` via `smsurf_GetSurfaceCache`.
+- **What happens:** The process dies with SIGSEGV (in `sm_DecomposeSrf`) when the surface cache of a B-spline surface is built.
+- **Trigger:** Surface of degree `q = 2` in v with v knots `0,0,0,d,1,1,1` and a UV domain overlapping the v range, `0 < d < 2e-12`; the limit scales with the knot magnitude (about `SM_EFF_ZERO * (1 + max |v knot|)`: `5 + d` crashes below about `7e-12`, `100 + d` below about `1.02e-10`). A tiny span at the end, in the interior or in the u direction does not crash. A knot vector whose start knot has multiplicity above `q + 1` (`0,0,-0.0,1,1` with `q = 1`: `-0.0 == 0.0`) crashes the same way, and so does a u vector with an end knot of multiplicity above `p + 1`; the same excess at the v end did not crash.
+- **How found:** crash in the C++ reference run (`--fuzz` of `intersect.surface_drop_lib_p3`, mutation of one v knot).
+- **Confirmed:** yes (the reference run and a GDB backtrace); the exact mechanism inside `sm_DecomposeSrf` was not traced.
+- **Severity:** crash/UB.
+- **Cause:** Not determined beyond `sm_DecomposeSrf`; the missing v-direction counterpart of the `[B262]` check is the likely place.
+- **Rust port:** Nothing is emulated. The FFI guard of `intersect.surface_drop_lib_p3` rejects the triggers (first v span zero, or below `SM_EFF_ZERO * (1 + max |v knot|)` with a domain overlapping the v range; a u end knot of multiplicity above `p + 1`). The title says near-zero span; the multiplicity cases share the entry.
 
 #### UB-194. `SM_HISTOGRAM_EDGELEN_INDEX` converts negative doubles to `ULONG`
 - **Location:** `source/SMLib/inc/SmTArray.h:2395`-`2397` (macro); used by `SmHealData::Cache_EdgeProps` (`source/SMLib/src/SmHealData.cpp:2523`).
@@ -2205,6 +2243,15 @@ meantime, whoever merges renumbers the new entry and every reference to it (here
 - **Confirmed:** source path only; no native hang reproduction was run.
 - **Severity:** hang.
 - **Rust port:** Ordinary squeeze statuses are ignored through `ignore_status`, preserving `Unported` propagation; a documented no-progress check returns an error if the interval count did not decrease.
+
+#### HANG-38. `SmSurface::DropCurve` can subdivide the same span forever
+- **Location:** `source/SMLib/src/SmSurfaceDropLib.cpp:5637` `SmSurface::DropCurve`, the span stack loop: a span that fails `TestSpanAccuracy` is split at `(sStart.m_dT + sEnd.m_dT) / 2.0` (`:5937`) and the split point pushed (`:6014`); a failing span is only accepted once it is shorter than `sInterval.GetLength() / 8000.0` (`:5824`).
+- **What happens:** Nothing bounds the stack. When `1/8000` of the interval is at most one ulp of the span ends, a span of one ulp neither passes that test nor shrinks: the midpoint rounds to `sEnd.m_dT`, `GetNextPoint` succeeds there, and the same point is pushed again on every iteration, so the stack grows until memory runs out.
+- **Trigger:** A non-degenerate curve interval of length `L` with `L / 8000 <= ulp(max |end|)` (some float spacing inside the interval is at least `L / 8000`) over a span that fails `TestSpanAccuracy`. A zero-length interval is not a trigger: `IsDegenerate` is `TRUE` on it, so no drop point gets `m_eDropDerivRtn == SM_SUCCESS` (`SmSurfaceDropLib.cpp:1894`-`1931`) and the keep-all rescue (`:5514`) needs a deviation below the tolerance.
+- **How found:** read during porting.
+- **Confirmed:** no.
+- **Severity:** hang.
+- **Rust port:** `intersect::surface_drop_lib::p3` bounds the stack at `MAX_SPAN_DEPTH` (64) drop points and returns `SolidError::NotConverged` past it (exact arithmetic needs about 15). The FFI rejects a non-degenerate interval (ends normalised, as `SmExtent1d` swaps them) of length `L` with `L / 8000 <= 2 ulp(max |end|)` (about 16000 ulps, twice the margin) and nothing else: zero-length, inverted and out-of-range intervals and any tolerance (zero and negative included) are accepted.
 
 #### HANG-31. `SmApiCreateCylindricalBox` hangs on nearly degenerate arcs and full turns
 - **Location:** `source/SM_API/src/SmApiPrimitives.cpp:766` `SmApiCreateCylindricalBox` -> `source/SMLib/src/SmPrimitiveCreation.cpp:424` `SmPrimitiveCreation::CreateCylindricalBox`, which builds the four boundary arcs with the three-point `SmCircle(start, mid, end)` constructor.
@@ -2444,7 +2491,7 @@ meantime, whoever merges renumbers the new entry and every reference to it (here
 - **How found:** read during porting (static scan, `plan/closure.md`).
 - **Confirmed:** no. The fillet units are not ported yet.
 - **Severity:** nondeterminism (order-dependent results).
-- **Rust port:** Not ported yet. The plan is to compute the step per call.
+- **Rust port:** `Kernel::fillet_point_step` latch (per kernel). The `blend.fillet_solver_p4` difftest probes the C++ static (`sc_blend_fillet_solver_p4_static_step`) before every case that can reach the finite-difference block and seeds the latch with it; see `plan/findings.md` (blend.fillet_solver_p4).
 
 ## Wrong result
 
@@ -3507,6 +3554,24 @@ meantime, whoever merges renumbers the new entry and every reference to it (here
 - **Confirmed:** yes: the `closed3d` cases of `fixtures/topology.loopuse/tolerance_limit.json` set every edge tolerance to 0, 1e-15 or -1e-12 so that real end gaps exceed `XSectTol3d`; both sides still report those loops closed (with the largest gap seen, also when `bCheckAllGaps == FALSE` stops early).
 - **Severity:** wrong result.
 - **Rust port:** Reproduces it (`topology::loopuse::is_closed_3d`).
+
+#### WR-100. `SmSurface::DropCurve` tests the domain's u length for the v degeneracy
+- **Location:** `source/SMLib/src/SmSurfaceDropLib.cpp:4250` `SmSurface::DropCurve`: `bDegenSurfV = sUVDomain.XLength() < SM_EFF_ZERO` (the line above sets `bDegenSurfU` the same way).
+- **What happens:** A drop domain degenerate in v is not reported (`SM_ERR_DEGENERATE_SURFACE`, `SM_CTC_DEGENSURFACE_FAIL`) and the drop goes on; `m_bDegenSurfV` of the failure record copies the u test.
+- **Trigger:** Only a natural domain degenerate in v reaches it (a given domain shorter than `SM_EFF_ZERO` in either direction is replaced by the natural one), e.g. a plane built over a domain of zero height.
+- **How found:** read during porting.
+- **Confirmed:** no.
+- **Severity:** wrong result.
+- **Rust port:** Reproduces it (`Surface::drop_curve_base`).
+
+#### WR-182. `SmSurfaceDropCurve::DoTrace` leaves its start points linked on the curve list
+- **Location:** `source/SMLib/src/SmSurfaceDropCurve.cpp:1766` `SmSurfaceDropCurve::TraceCurve2`: `m_vCurvePoints.Append(&rStartPoint)`, called by `DoTrace` (`:1689`-`1703`) for every node of `m_vStartPoints`; `SmTList` is intrusive (`SmTracePnt : SmListNode`, `SmTList.h:224`-`244`).
+- **What happens:** The start node is appended to `m_vCurvePoints` without being removed from `m_vStartPoints` (the base tracer removes coincident start points first, `SmSurfaceTracer.cpp:621`-`637`). `Append` overwrites the node's links, so `m_vStartPoints` (a head pointer) then walks the curve ring: the other start points drop out of it and every point later added to the curve shows up in it, and a later `Remove` from either list unlinks the node from the other. `DoTrace` itself iterates a snapshot of the start list, but a `TraceCurve` fallback walks `m_vStartPoints` in its end test and `AddStartPoint`.
+- **Trigger:** Any `DoTrace` with a start point (every drop that reaches the trace), followed by a read of the start points or by more curve points.
+- **How found:** difftest `intersect.surface_drop_curve` gen0354 (a trace once the offset surface and `SmSurface::DropCurve` were ported): after `DoTrace` and further `ComputeNextPoint`/`TraceCurve2` ops, the C++ start list held the three new curve points.
+- **Confirmed:** yes (C++ build, gen0354).
+- **Severity:** wrong result (list state; the traversals still end, the nodes live in the block manager).
+- **Rust port:** Does not reproduce it: the start and curve lists are id `Vec`s (`intersect::surface_tracer`). The difftest reports a start list that shares a node with the curve list as `-3` on both sides instead of reading it.
 
 #### WR-154. Discontinuity classifiers select boundary solution slots with V+V offsets
 - **Location:** `source/SMLib/src/SmCurveClass.cpp:9241`, `:9654`, `:10121-10129`.

@@ -6,6 +6,11 @@ compares the results. A unit may be marked `status = "green"` in
 `plan/units/<id>.toml` only when `difftest --status-of <id>` prints `green`, and
 `status = "partial"` only when it prints `partial` (AGENTS.md section 4a).
 
+`audit.recursion` is a crate-wide audit rather than a port: it has no standalone
+C++ counterpart or runner and is excluded from `--green`. Its plan status records
+the audit of the current merged code; its numerical regression check reruns the
+ported units with `--green`. Future ports still need their own recursion review.
+
 ## Quick start
 
 ```sh
@@ -26,7 +31,7 @@ nice -n 10 cargo test -p difftest --features cpp                     # harness s
 |---|---|
 | `--unit <id>` | run one unit (repeatable; `*` and `?` match several registered runners, e.g. `--unit 'nlib.*'`) |
 | `--jobs N` / `-j N` | run N units at a time, each in its own child process (default `1`: one process, in order; `0`: every core). Output, reports and exit status are the same as with `1` (below) |
-| `--green` | all units with `status = "green"` or `"partial"` in `plan/units/*.toml` (one without a runner FAILS; a `green` unit that comes out partial FAILS) |
+| `--green` | all port units with `status = "green"` or `"partial"` in `plan/units/*.toml`, excluding `audit.recursion` (a crate-wide audit with no runner; a port without a runner FAILS; a `green` port that comes out partial FAILS) |
 | `--status-of <id>` | run the unit (no report) and print only `green`, `partial` or `fail`; exit `1` on `fail` (also when no runner is registered) |
 | `--all` | every registered runner |
 | `--list` | registered runners, their plan status and case counts |
@@ -43,14 +48,28 @@ Exit status: `0` no failures (deferred cases are not failures), `1` any
 failure, `2` usage or setup error. Output: one summary line per unit,
 
 ```
-PASS|PARTIAL|FAIL <unit> cases=… passed=… failed=… deferred=… max_rel_err=… with_values=… no_values=… [blocked_by=<unit>(<n>),…]
+PASS|PARTIAL|FAIL <unit> cases=… passed=… failed=… deferred=… max_rel_err=… with_values=… no_values=… vacuous=… [blocked_by=<unit>(<n>),…]
 ```
 
 then the first few failing cases and `reports/difftest/<unit>.json`.
 `with_values` / `no_values` split the passing cases into those that compared
 at least one float, integer or topology entry and those that compared nothing
-(both sides returned the same error, or empty outputs). A unit whose passes are
-mostly `no_values` proves little: make the generator reach the success path.
+(both sides returned the same error, or empty outputs). `vacuous` counts the
+`no_values` passes where both sides *succeeded*: only the operation status was
+compared. A unit whose passes are mostly `no_values` proves little: make the
+generator reach the success path.
+
+**Status is compared.** `Output::error` is the operation's status (`None` =
+success) and is compared on every case: C++ success against a Rust error fails
+even when both outputs are empty. A Rust runner must therefore never turn an
+`Err` into an empty or default output (`unwrap_or_default()`, `.ok()`,
+`if let Ok(..)` without an `else`, `Err(_) => vec![]`, ...): map it with
+`Output::from_result` (or `Output::unported(&e).unwrap_or_else(|| Output::err(..))`),
+or, for an op inside a larger record, push the status it maps to (as the C++ shim
+does) before any default. Otherwise "C++ computed 0 results" and "Rust failed"
+look identical and the case passes vacuously. The report marks such cases
+`"vacuous": true`, and passes that agreed only on zeros (e.g. `count = 0`)
+`"only_zeros": true`; audit those runners first.
 
 **Timing** (stderr, one line per unit; diagnostic only, not in the report):
 

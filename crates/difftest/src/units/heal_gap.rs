@@ -566,7 +566,7 @@ fn curve_of(k: &Kernel, c: &CurveIn) -> Result<Curve, HarnessError> {
         CurveIn::CrvOnSurf { uv, surface } => {
             let c = Curve::from(BSplineCurve::from_nurb(nl_curve(uv)?, 2, false));
             Curve::from(
-                CrvOnSurf::new(k, c, bss_of(surface)?, None, 3)
+                CrvOnSurf::new(k, c, Surface::from(bss_of(surface)?), None, 3)
                     .map_err(|e| harness(format!("crv on surf: {e}")))?,
             )
         }
@@ -592,7 +592,7 @@ fn surface_of(s: &SurfIn) -> Result<Surface, HarnessError> {
             Vec::new(),
             Vec::new(),
             true,
-        )),
+        ).map_err(|e| HarnessError::new(e.to_string()))?),
     })
 }
 
