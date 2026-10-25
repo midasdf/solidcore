@@ -66,6 +66,8 @@ use solidcore::geom::object::{ObjectRef, ShapeMember};
 use solidcore::geom::solution_array::{ObjectKind, Solution, SolutionArray, SolutionObject};
 use solidcore::geom::tol::{update_object_tolerance, zone_tol3d, TopologyToUpdate, UNINIT_TOL};
 use solidcore::intersect::curve_class::p1::{CurveClassification, CurveInterval};
+use solidcore::intersect::curve_class::p5::ClassGeometryMut;
+use solidcore::intersect::curve_class::p6::{MergeContext, MergeIntervalBrep};
 use solidcore::intersect::point_class::{
     ClassGeometry, ClassObject, ClassObjectKind, PointClassType, PointClassification,
 };
@@ -100,7 +102,7 @@ use solidcore::topology::topology::Topology;
 use solidcore::topology::vertex as vx;
 use solidcore::query::brep::{BrepIdentity, BrepQuery};
 use solidcore::topology::{
-    Brep, BrepId, EdgeId, EdgeuseId, FaceId, LoopId, VertexId, VertexuseId,
+    Brep, BrepId, EdgeId, EdgeuseId, FaceId, LoopId, LoopuseId, RegionId, VertexId, VertexuseId,
 };
 use solidcore::{EntityRef, SolidError};
 use solidcore_ffi::units::boolean_topology_intersector_p1::{self as ffi, Op};
@@ -615,6 +617,8 @@ pub(super) const K_VERTEXUSE: u8 = 12;
 pub(super) const K_TRIM_CURVE: u8 = 13;
 /// A region (classification results).
 const K_REGION: u8 = 14;
+/// A loop use a face's trimmed surface cache names (Rust side only, never exported).
+const K_LOOPUSE: u8 = 15;
 
 /// An object handle: the B-rep (`2` for the curve stores, `-1` for the intersector),
 /// the kind and the index. Ordered as the shim sorts (`brep`, `kind`, `index`). A
@@ -923,6 +927,37 @@ impl Two {
     }
 }
 
+/// The handle of an entity of B-rep `b` a face's trimmed surface cache names (its
+/// faces, edges, vertices, loop uses, edge uses and vertex uses).
+fn cache_entity_h(b: i8, e: EntityRef) -> solidcore::Result<H> {
+    Ok(match e {
+        EntityRef::Face(f) => hd(b, K_FACE, f.index()),
+        EntityRef::Edge(x) => hd(b, K_EDGE, x.index()),
+        EntityRef::Vertex(v) => hd(b, K_VERTEX, v.index()),
+        EntityRef::Loopuse(lu) => hd(b, K_LOOPUSE, lu.index()),
+        EntityRef::Edgeuse(eu) => hd(b, K_EDGEUSE, eu.index()),
+        EntityRef::Vertexuse(vu) => hd(b, K_VERTEXUSE, vu.index()),
+        _ => return Err(invalid("entity a surface cache does not name")),
+    })
+}
+
+/// The entity of B-rep `b` a surface cache handle names (inverse of
+/// [`cache_entity_h`]).
+fn cache_h_entity(b: i8, h: H) -> solidcore::Result<EntityRef> {
+    if h.b != b {
+        return Err(invalid("surface cache handle of another B-rep"));
+    }
+    Ok(match h.kind {
+        K_FACE => EntityRef::Face(fid(h)),
+        K_EDGE => EntityRef::Edge(eid(h)),
+        K_VERTEX => EntityRef::Vertex(vid(h)),
+        K_LOOPUSE => EntityRef::Loopuse(LoopuseId::from_index(h.i)),
+        K_EDGEUSE => EntityRef::Edgeuse(EdgeuseId::from_index(h.i)),
+        K_VERTEXUSE => EntityRef::Vertexuse(VertexuseId::from_index(h.i)),
+        _ => return Err(invalid("handle a surface cache does not name")),
+    })
+}
+
 impl ClassGeometry<H> for Two {
     fn curve(&self, o: H) -> Option<&SmCurve> {
         match o.kind {
@@ -993,6 +1028,62 @@ impl ClassGeometry<H> for Two {
     }
 }
 
+// The mutable access `MergeClassifications` imprints the classifications through
+// (unit `boolean.topology_intersector_p3`): the B-rep behind a handle, its vertex
+// notification store, and handles for the entities its edits make.
+impl ClassGeometryMut<H> for Two {
+    fn curve_mut(&mut self, o: H) -> Option<&mut SmCurve> {
+        ProtoGeometry::curve_mut(self, o)
+    }
+    fn topology_entity_mut(&mut self, o: H) -> Option<(&mut Brep, EntityRef)> {
+        let (_, e) = ClassGeometry::topology_entity(self, o)?;
+        Some((self.brep_mut(o)?, e))
+    }
+}
+
+impl MergeIntervalBrep<H> for Two {
+    fn merge_context(&mut self, o: H) -> Option<MergeContext<'_, H>> {
+        let target = match o.kind {
+            K_VERTEX => EntityRef::Vertex(vid(o)),
+            K_EDGE => EntityRef::Edge(eid(o)),
+            K_FACE => EntityRef::Face(fid(o)),
+            K_REGION => EntityRef::Region(RegionId::from_index(o.i)),
+            _ => return None,
+        };
+        let slot = usize::try_from(o.b).ok()?;
+        // an edit deletes the B-rep's cache (SmBrep::Notify PRE_EDIT); the next use
+        // rebuilds it
+        self.caches.get_mut(slot)?.take();
+        let brep = self.breps.get_mut(slot)?.as_mut()?;
+        let store = self.env.get_mut(slot)?;
+        let b = o.b;
+        Some(MergeContext {
+            brep,
+            target,
+            handle: Box::new(move |e| match e {
+                EntityRef::Vertexuse(vu) => hd(b, K_VERTEXUSE, vu.index()),
+                e => Two::entity_h(b, e).unwrap_or(hd(b, K_NULL as u8, 0)),
+            }),
+            notifications: solidcore::topology::edge::NotifyEnv {
+                records: &mut store.records,
+                attributes: &mut store.attributes,
+                context: None,
+                key_of: &p9_entity_ref,
+            },
+            curve_ref: &merge_curve_ref,
+        })
+    }
+}
+
+/// The identity of an edge's curve for the merge's edits (as `make_vertex_split_edge`
+/// gives it).
+fn merge_curve_ref(e: EdgeId, kind: i64) -> ObjectRef {
+    ObjectRef {
+        key: ObjectKey(((kind as u64) << 32) | u64::from(e.index())),
+        type_code: kind,
+    }
+}
+
 impl ProtoGeometry<H> for Two {
     fn curve_mut(&mut self, o: H) -> Option<&mut SmCurve> {
         match o.kind {
@@ -1022,6 +1113,21 @@ impl ClassGeometry<H> for Objs<'_> {
     }
     fn point(&self, o: H) -> Option<Point3> {
         ClassGeometry::point(self.two, o)
+    }
+    // the topology handles are those of the pair, so the classification's topology
+    // members (`SmVertex::GetTolerance`, `SmEdge::GetTolerance`, ...) reach the same
+    // entities through either adapter
+    fn classification_vertex_point(&self, o: H) -> Option<Point3> {
+        self.two.classification_vertex_point(o)
+    }
+    fn topology_zone_tol_3d(&self, o: H) -> Option<f64> {
+        self.two.topology_zone_tol_3d(o)
+    }
+    fn topology_entity(&self, o: H) -> Option<(&Brep, EntityRef)> {
+        self.two.topology_entity(o)
+    }
+    fn topology_handle_in(&self, brep: &Brep, entity: EntityRef) -> Option<H> {
+        self.two.topology_handle_in(brep, entity)
     }
 }
 
@@ -1058,6 +1164,69 @@ impl CurveOnClassifyObjects<H> for Objs<'_> {
 }
 
 impl ProtoBrep<H> for Two {
+    fn merge_point_class_into_brep(
+        &mut self,
+        k: &mut Kernel,
+        pc: &mut PointClassification<H>,
+        src_point: Point3,
+    ) -> solidcore::Result<solidcore::intersect::point_class::MergeOutputs<H>> {
+        solidcore::intersect::curve_class::p6::merge_into_object_mut(k, self, pc, src_point)
+    }
+    /// `SmEdgeuse::EvaluateBinormal(t, FALSE, ..)` on the operand's B-rep.
+    fn edgeuse_evaluate_binormal(
+        &mut self,
+        k: &Kernel,
+        edgeuse: H,
+        param: f64,
+    ) -> solidcore::Result<Vec3> {
+        if edgeuse.kind != K_EDGEUSE {
+            return Err(invalid("not an edge use handle"));
+        }
+        let b = self.brep_m(edgeuse)?;
+        Ok(solidcore::topology::edgeuse::p3::evaluate_binormal(
+            k,
+            b,
+            EdgeuseId::from_index(edgeuse.i),
+            param,
+            false,
+            &solidcore::topology::edgeuse::p3::BinormalOptions::default(),
+        )?
+        .binormal)
+    }
+    /// `SmBrep::MakeEdgeInFace` of the operand's own B-rep (its own
+    /// `m_bEditingEnabled`), through the merge context of the face.
+    fn brep_make_edge_in_face(
+        &mut self,
+        k: &Kernel,
+        brep: H,
+        face: H,
+        start: H,
+        end: H,
+        curve: SmCurve,
+        uv_curve: Option<SmCurve>,
+        interval: Extent1d,
+        orientation: OrientType,
+        tolerance: f64,
+    ) -> solidcore::Result<(Option<H>, Option<H>, Option<H>)> {
+        let in_brep = |h: H, kind| brep.kind == K_BREP && h.b == brep.b && h.kind == kind;
+        if !in_brep(face, K_FACE) || !in_brep(start, K_VERTEX) || !in_brep(end, K_VERTEX) {
+            return Err(invalid("face or vertex is not in the B-rep"));
+        }
+        let ctx = self
+            .merge_context(face)
+            .ok_or_else(|| invalid("handle names an absent B-rep"))?;
+        solidcore::topology::proto_topology::p2::make_edge_in_face_in_context(
+            k,
+            ctx,
+            vid(start),
+            vid(end),
+            curve,
+            uv_curve,
+            interval,
+            orientation,
+            tolerance,
+        )
+    }
     fn brep_squeeze_edge(
         &mut self,
         k: &mut Kernel,
@@ -1090,6 +1259,68 @@ impl ProtoBrep<H> for Two {
     }
     fn face_uv_domain(&self, face: H) -> Option<Extent2d> {
         fp2::uv_domain(self.brep(face)?, fid(face)).ok()
+    }
+    fn face_trim_uv_domain(&mut self, k: &Kernel, face: H) -> solidcore::Result<Extent2d> {
+        if face.kind != K_FACE {
+            return Err(invalid("not a face handle"));
+        }
+        let b = self.brep_m(face)?;
+        b.face(fid(face))
+            .map_err(|_| invalid("unknown face handle"))?;
+        let mut output = solidcore::topology::face::p1::UvDomainFromTrim {
+            domain: Extent2d::new(),
+            max_uv_loop_gap: 0.0,
+            second_max_uv_loop_gap: 0.0,
+        };
+        let result = solidcore::topology::face::p1::calculate_uv_domain_from_uv_trim_curves_into(
+            k,
+            b,
+            fid(face),
+            true,
+            false,
+            false,
+            &mut output,
+        );
+        if let Err(error) = result {
+            if error.is_unported() {
+                return Err(error);
+            }
+        }
+        Ok(output.domain)
+    }
+    fn face_point_classify_uv(
+        &mut self,
+        k: &Kernel,
+        face: H,
+        uv: Point2,
+        source_tolerance: f64,
+    ) -> solidcore::Result<PointClassType> {
+        if face.kind != K_FACE {
+            return Err(invalid("not a face handle"));
+        }
+        let b = self.brep_m(face)?;
+        b.face(fid(face))
+            .map_err(|_| invalid("unknown face handle"))?;
+        let mut output = PointClassification::new(source_tolerance);
+        let result = point_classify(
+            k,
+            b,
+            fid(face),
+            uv,
+            &mut output,
+            PointClassifyOptions {
+                src_zone_tol_3d: source_tolerance,
+                do_boundary_intersections: true,
+                use_uv_classification: true,
+                ..PointClassifyOptions::default()
+            },
+        );
+        if let Err(error) = result {
+            if error.is_unported() {
+                return Err(error);
+            }
+        }
+        Ok(output.point_class())
     }
     fn set_face_uv_domain(&mut self, face: H, domain: Extent2d) -> Option<()> {
         fp2::set_uv_domain(self.brep_mut(face)?, fid(face), &domain).ok()
@@ -1315,6 +1546,28 @@ impl solidcore::topology::proto_topology::p3::BrepGlue<H> for Two {
 }
 
 impl IntersectorBrep<H> for Two {
+    fn face_point_3d_classify(
+        &mut self,
+        k: &Kernel,
+        face: H,
+        point: Point3,
+        src_zone_tol_3d: f64,
+        do_boundary_intersections: bool,
+        pc: &mut PointClassification<H>,
+        opt_guess_uv: Option<Point2>,
+    ) -> solidcore::Result<()> {
+        super::boolean_topology_intersector_p3::face_point_3d_classify(
+            self,
+            k,
+            face,
+            point,
+            src_zone_tol_3d,
+            do_boundary_intersections,
+            pc,
+            opt_guess_uv,
+        )
+    }
+
     fn make_vertex_loop(&mut self, brep: H, face: H, point: Point3) -> solidcore::Result<(H, H)> {
         if brep.kind != K_BREP || face.kind != K_FACE || brep.b != face.b {
             return Err(invalid("vertex loop owner mismatch"));
@@ -1616,36 +1869,48 @@ impl IntersectorBrep<H> for Two {
         face2: H,
         approx_tol_3d: f64,
         ang_tol_deg: f64,
+        wants: ti::FaceIntersectWants,
         opt_coincidence_flag: Option<bool>,
     ) -> solidcore::Result<ti::FaceIntersection<H>> {
         if face1.kind != K_FACE || face2.kind != K_FACE {
             return Err(invalid("FaceIntersect needs two faces"));
         }
-        if face1.b != face2.b {
-            // UNPORTED(topology.face_p3): SmFace::FaceIntersect of faces of two B-reps --
-            // justified: topology::face::p3::face_intersect takes one B-rep arena
-            return Err(SolidError::unported(
-                "SmFace::FaceIntersect (faces of two B-reps)",
-                "topology.face_p3",
-            ));
-        }
         let options = FaceIntersectOptions {
             want_this_classes: true,
             want_other_classes: true,
             want_cc_curves: true,
+            want_this_uv_curves: wants.this_uv_curves,
+            want_other_uv_curves: wants.other_uv_curves,
+            want_points: wants.points_3d,
             coincidence: opt_coincidence_flag,
-            ..FaceIntersectOptions::default()
         };
-        let out = fp3::face_intersect(
+        // the faces may be of two B-reps (`face_intersect_breps`); their caches are
+        // made on them (smsurf_GetSurfaceCache)
+        let breps = if face1.b == face2.b {
+            fp3::FaceBreps::One(self.brep_m(face1)?)
+        } else {
+            let [first, second] = &mut self.breps;
+            let (this, other) = match (face1.b, face2.b) {
+                (0, 1) => (first.as_mut(), second.as_mut()),
+                (1, 0) => (second.as_mut(), first.as_mut()),
+                _ => (None, None),
+            };
+            match (this, other) {
+                (Some(this), Some(other)) => fp3::FaceBreps::Two(this, other),
+                _ => return Err(invalid("handle names an absent B-rep")),
+            }
+        };
+        let out = fp3::face_intersect_breps(
             k,
-            self.brep_r(face1)?,
+            breps,
             fid(face1),
             fid(face2),
             approx_tol_3d,
             ang_tol_deg,
             &options,
         )?;
-        let bi = face1.b;
+        // the B-rep of a classification object of `side` (see `IntersectObject`)
+        let brep_of = |side: bool| if side { face2.b } else { face1.b };
 
         // every curve the call made gets a handle in the curve store
         let mut curves_3d = Vec::new();
@@ -1659,6 +1924,8 @@ impl IntersectorBrep<H> for Two {
         )?;
         let uv1 = self.register_curves(out.cc_this_uv_curves.unwrap_or_default())?;
         let uv2 = self.register_curves(out.cc_other_uv_curves.unwrap_or_default())?;
+        let this_uv_curves = self.register_curves(out.this_uv_curves.unwrap_or_default())?;
+        let other_uv_curves = self.register_curves(out.other_uv_curves.unwrap_or_default())?;
 
         // the classifications name their objects by handle
         let mut map = |o: IntersectObject| -> solidcore::Result<H> {
@@ -1667,15 +1934,17 @@ impl IntersectorBrep<H> for Two {
                 IntersectObject::Curve(i) => cc3d.get(i).copied().flatten().ok_or_else(bad),
                 IntersectObject::UvCurve(i, false) => uv1.get(i).copied().flatten().ok_or_else(bad),
                 IntersectObject::UvCurve(i, true) => uv2.get(i).copied().flatten().ok_or_else(bad),
-                IntersectObject::Surface(f) => Ok(hd(bi, K_FACE_SURFACE, f.index())),
-                IntersectObject::EdgeCurve(e) => self
-                    .edge_curve_h(hd(bi, K_EDGE, e.index()))
+                IntersectObject::Surface(f, side) => {
+                    Ok(hd(brep_of(side), K_FACE_SURFACE, f.index()))
+                }
+                IntersectObject::EdgeCurve(e, side) => self
+                    .edge_curve_h(hd(brep_of(side), K_EDGE, e.index()))
                     .flatten()
                     .ok_or_else(bad),
-                IntersectObject::Trim(eu) => Ok(hd(bi, K_TRIM_CURVE, eu.index())),
-                IntersectObject::Topology(e) => match e {
-                    EntityRef::Vertexuse(vu) => Ok(hd(bi, K_VERTEXUSE, vu.index())),
-                    other => Self::entity_h(bi, other).ok_or_else(bad),
+                IntersectObject::Trim(eu, side) => Ok(hd(brep_of(side), K_TRIM_CURVE, eu.index())),
+                IntersectObject::Topology(e, side) => match e {
+                    EntityRef::Vertexuse(vu) => Ok(hd(brep_of(side), K_VERTEXUSE, vu.index())),
+                    other => Self::entity_h(brep_of(side), other).ok_or_else(bad),
                 },
             }
         };
@@ -1696,6 +1965,9 @@ impl IntersectorBrep<H> for Two {
                 uv1.into_iter().flatten().collect(),
                 uv2.into_iter().flatten().collect(),
             ],
+            this_uv_curves: this_uv_curves.into_iter().flatten().collect(),
+            other_uv_curves: other_uv_curves.into_iter().flatten().collect(),
+            points_3d: out.points_3d.unwrap_or_default(),
         })
     }
     fn editing_enabled(&self, brep: H) -> solidcore::Result<bool> {
@@ -1728,6 +2000,30 @@ impl IntersectorBrep<H> for Two {
     }
     fn topology_objects(&self) -> &dyn TopologyObjects<H> {
         self
+    }
+    fn face_cache_target(&mut self, face: H) -> solidcore::Result<ti::FaceCacheTarget<'_, H>> {
+        if face.kind != K_FACE {
+            return Err(invalid("not a face handle"));
+        }
+        let b = face.b;
+        let surface = self
+            .face_surface_h(face)
+            .flatten()
+            .ok_or_else(|| invalid("face without surface"))?;
+        Ok(ti::FaceCacheTarget {
+            brep: self.brep_m(face)?,
+            face: fid(face),
+            surface,
+            handles: Box::new(move |e| cache_entity_h(b, e)),
+            entities: Box::new(move |h| cache_h_entity(b, h)),
+        })
+    }
+    fn face_entity_handles(&self, face: H) -> solidcore::Result<ti::EntityHandles<H>> {
+        if face.kind != K_FACE {
+            return Err(invalid("not a face handle"));
+        }
+        let b = face.b;
+        Ok(Box::new(move |e| cache_entity_h(b, e)))
     }
     fn brep_delete_face(&mut self, k: &mut Kernel, brep: H, face: H) -> solidcore::Result<()> {
         if brep.kind != K_BREP || face.b != brep.b {
@@ -1895,6 +2191,7 @@ fn own_geometry(b: &mut Brep, slot: usize) {
         if let Some(surface) = b.face_mut(f).ok().and_then(|x| x.surface.as_mut()) {
             let _ = surface.set_owner(Some(query_key(slot, CacheObject::Face(f))));
         }
+        let _ = b.sync_face_surface_tolerance(f);
     }
 }
 
@@ -3826,7 +4123,19 @@ fn run_part2_op(
                 o.push(NULL_DEREF);
                 return Ok(());
             }
-            status(ti.intersect_insert_relate(k, two, TI_HANDLE), o)?;
+            // (where upstream reads a freed proto edge, UB-175, the shim's verbatim copy
+            // unlinks the stale entries and answers -2; the port goes on with its defined
+            // teardown and records the condition on the kernel. After a failed imprint,
+            // UB-242, both stop and the shim answers -2.)
+            k.upstream_ub_passed.clear();
+            let r = ti.intersect_insert_relate(k, two, TI_HANDLE);
+            if k.upstream_ub_passed.contains(&"UB-242")
+                || (r.is_ok() && k.upstream_ub_passed.contains(&"UB-175"))
+            {
+                o.push(NULL_DEREF);
+                return Ok(());
+            }
+            status(r, o)?;
         }
         OpIn::FixupClass { b, o: oc } | OpIn::FixupSplit { b, o: oc, .. } => {
             let split = matches!(op, OpIn::FixupSplit { .. });
