@@ -92,12 +92,12 @@ use crate::math::{max2, Point3, Vec3, BIG_DOUBLE, EFF_ZERO};
 use crate::nurbs::b_spline_curve::BSplineCurve;
 use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
 use crate::query::brep::{self as qbrep, BoundingBoxOptions};
-use crate::query::face::p2::CurveOnClassifyObjects;
+use crate::query::face::p2::{CurveOnClassifyBrep, CurveOnClassifyObjects, FaceBrep};
 use crate::surface::surface::Surface;
 use crate::topology::brep::p1;
 use crate::topology::brep::p4;
 use crate::topology::brep::p6;
-use crate::topology::brep_cache::{make_brep_cache, BrepObjects, CacheObject, CacheSource};
+use crate::topology::brep_cache::{make_brep_cache, CacheObject, CacheSource};
 use crate::topology::brep_data::{BrepData, TopologyData, NO_OBJECT, UNSURE};
 use crate::topology::edge::NotifyEnv;
 use crate::topology::edgeuse::p1 as eu1;
@@ -500,6 +500,10 @@ fn make_topology(
             None,
             options.make_uv_trim_curves,
         )?;
+        // UV trim curves created inside the healer (Make_UVTrimCurves and
+        // ClassifyLoops' snapshot write-back) have no caller owner yet; bind them to
+        // their edge uses as upstream's SetUVTrimCurve(this) does.
+        bind_uv_trim_owners(b, env.key_of)?;
     }
     let _ = options.check_uv_trim_curves; // SM_REF1: not used
     Ok(())
@@ -1736,7 +1740,8 @@ fn create_parallel_projection_curves(
 /// `false`), curve `i` being [`IntersectObject::Curve`]`(i)` and its UV curve
 /// [`IntersectObject::UvCurve`]`(i, false)`. Upstream's `MergeIntervals` edits the B-rep
 /// through the classification's `SmFace*`, `SmEdge*` and `SmVertex*` pointers, so the
-/// adapter holds the B-rep mutably and hands the classification read-only views of it.
+/// adapter holds the B-rep mutably and hands the classification read-only views of it;
+/// `CurveOnClassify` classifies on that B-rep in place ([`CurveOnClassifyBrep`]).
 struct MergeCurvesWorld<'a, 'e> {
     b: &'a mut Brep,
     curves_3d: Vec<Curve>,
@@ -1860,10 +1865,19 @@ impl MergeIntervalBrep<IntersectObject> for MergeCurvesWorld<'_, '_> {
     }
 }
 
-impl crate::topology::brep::p2::MergeCurvesObjects<IntersectObject> for MergeCurvesWorld<'_, '_> {
+impl FaceBrep for MergeCurvesWorld<'_, '_> {
     fn brep(&self) -> &Brep {
         self.b
     }
+}
+
+impl CurveOnClassifyBrep<IntersectObject> for MergeCurvesWorld<'_, '_> {
+    fn brep_mut(&mut self) -> &mut Brep {
+        self.b
+    }
+}
+
+impl crate::topology::brep::p2::MergeCurvesObjects<IntersectObject> for MergeCurvesWorld<'_, '_> {
     fn edge_of(&self, object: IntersectObject) -> Option<EdgeId> {
         match object {
             IntersectObject::Topology(EntityRef::Edge(e), _) => Some(e),
@@ -1972,17 +1986,23 @@ fn point_from_solution(
     crate::topology::brep::p2::point_from_solution(k, b, solution, start)
 }
 
-fn remove_faces(k: &mut Kernel, b: &mut Brep, faces: &[FaceId]) -> Result<()> {
+fn remove_faces(
+    k: &mut Kernel,
+    b: &mut Brep,
+    notify: &mut NotifyEnv<'_>,
+    faces: &[FaceId],
+) -> Result<()> {
     // SmBrep::RemoveFaces (topology.brep_p5) reads the B-rep's own m_bEditingEnabled
     let editing = b.editing_enabled();
-    super::p5::remove_faces(k, b, editing, faces)
+    super::p5::remove_faces_notified(k, b, editing, faces, notify)
 }
 
 /// `SmBrep::ProjectAndTrim`: projects `curve` along `direction` onto the B-rep's faces
 /// (or `subset_faces`), imprints the projections as edges, and unless
 /// [`TrimType::Split`] removes the faces on the side of the projection plane the
 /// reference point selects. Editing is enabled; the kernel context's "doing Boolean"
-/// flag is set meanwhile. The merges' B-rep edits are notified through `notify`.
+/// flag is set meanwhile. The merges' and face removals' B-rep edits are notified
+/// through `notify`.
 ///
 /// # Errors
 ///
@@ -2075,7 +2095,7 @@ fn project_and_trim_body(
     let to_delete = to_delete?;
 
     // Remove the indicated Faces.
-    remove_faces(k, b, &to_delete)
+    remove_faces(k, b, notify, &to_delete)
 }
 
 /// Classifies each face against the plane of the projected curve: by the votes of
@@ -2083,7 +2103,7 @@ fn project_and_trim_body(
 /// direction.
 fn faces_to_delete(
     k: &mut Kernel,
-    b: &Brep,
+    b: &mut Brep,
     env: &ProjectEnv<'_>,
     curve: &BSplineCurve,
     direction: Vec3,
@@ -2147,7 +2167,7 @@ fn faces_to_delete(
             let vertex_keys: Vec<_> = vertices.iter().map(|&v| (env.brep_id, v)).collect();
             let shape = Shape::new(
                 k,
-                &(env.brep_id, b),
+                &(env.brep_id, &*b),
                 &[],
                 &[(env.brep_id, face)],
                 &edge_keys,
@@ -2155,7 +2175,7 @@ fn faces_to_delete(
             )?;
 
             // Find a ray to determine which face needs to be kept or deleted
-            let bbox = qbrep::calculate_bounding_box(k, b, BoundingBoxOptions::default())?;
+            let bbox = qbrep::calculate_bounding_box(k, &*b, BoundingBoxOptions::default())?;
             let sphere = bbox.sphere_bound();
             let param = line_closest_point(reference, direction, sphere.center);
             let projected_center = reference + direction * param;
@@ -2163,37 +2183,38 @@ fn faces_to_delete(
             let ray_end = projected_center + direction * (2.0 * sphere.radius);
             let segment = Curve::from(BSplineCurve::create_line_segment(3, ray_start, ray_end)?);
 
-            let cache = make_brep_cache(k, CacheSource::Brep(b), env.keys)?;
-            let objects = BrepObjects {
-                preparation: None,
-                brep: b,
+            let cache = make_brep_cache(k, CacheSource::Brep(&*b), env.keys)?;
+            let identity = qbrep::BrepIdentity {
                 brep_id: env.brep_id,
-                cache: Some(&cache),
                 keys: env.keys,
                 owner_of: env.owner_of,
             };
+            let brep_tol = b.tolerance();
             // the two output vectors of the solve (uninitialised upstream)
             let vectors = [Vec3::ZERO, Vec3::ZERO];
-            let solutions = TopologySolver::shape_curve_solve(
-                k,
-                &objects,
-                &shape,
-                CurveRef {
-                    curve: &segment,
-                    handle: CacheObject::Other(ObjectRef {
-                        type_code: BSPLINE_CURVE_TYPE,
-                        key: ObjectKey(0),
-                    }),
-                },
-                &segment.natural_interval(),
-                TopologySolveOptions {
-                    operation: SolverOperation::Minimize,
-                    requested: SolutionRequested::Single,
-                    tolerance_3d: b.tolerance(),
-                    best_answer_so_far_sq: BIG_DOUBLE,
-                    opt_vectors: &vectors,
-                },
-            )?;
+            let solutions = {
+                let objects = qbrep::LiveBrepObjects::new(b, &identity, Some(&cache))?;
+                TopologySolver::shape_curve_solve(
+                    k,
+                    &objects,
+                    &shape,
+                    CurveRef {
+                        curve: &segment,
+                        handle: CacheObject::Other(ObjectRef {
+                            type_code: BSPLINE_CURVE_TYPE,
+                            key: ObjectKey(0),
+                        }),
+                    },
+                    &segment.natural_interval(),
+                    TopologySolveOptions {
+                        operation: SolverOperation::Minimize,
+                        requested: SolutionRequested::Single,
+                        tolerance_3d: brep_tol,
+                        best_answer_so_far_sq: BIG_DOUBLE,
+                        opt_vectors: &vectors,
+                    },
+                )?
+            };
 
             let Some(first) = solutions.as_slice().first() else {
                 continue;

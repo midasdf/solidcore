@@ -35,10 +35,12 @@ use solidcore::nurbs::b_spline_curve::BSplineCurve;
 use solidcore::nurbs::math::CPoint;
 use solidcore::primitive::api_curves as curves;
 use solidcore::primitive::api_primitives as primitives;
+use solidcore::primitive::primitive_creation::SweepOptions;
 use solidcore::surface::surface::p2::SurfaceKind;
 use solidcore::surface::surface::Surface;
 use solidcore::sweep::api_brep as sweep;
 use solidcore::sweep::api_brep as sweeps;
+use solidcore::sweep::api_surfaces::create_skin_primitive;
 use solidcore::topology::brep::p1::regions;
 use solidcore::topology::brep::p2::ArenaNotifyState;
 use solidcore::topology::brep::p3;
@@ -91,6 +93,10 @@ pub struct Case {
     /// What this variant is.
     #[serde(default)]
     pub note: Option<String>,
+    /// Opt-in `Kernel::fixes` fields (`UpstreamFixes`) the case runs with, by field name
+    /// (none: pinned SMLib behaviour).
+    #[serde(default)]
+    pub fixes: Vec<String>,
     /// Run in order; each writes the body `id`.
     pub steps: Vec<Step>,
     /// Checked on the body `result`.
@@ -134,6 +140,20 @@ pub enum Step {
         radius: f64,
         /// Length along the axis.
         height: f64,
+    },
+    /// A copy (`SmApiBrepCopy`) of `body` turned about the line through `point` along `axis`, with
+    /// `SmApiRotate`.
+    Rotate {
+        /// Body written.
+        id: String,
+        /// Body turned (left as it is).
+        body: String,
+        /// A point on the axis.
+        point: P3,
+        /// Axis direction.
+        axis: P3,
+        /// Angle in degrees.
+        degrees: f64,
     },
     /// `SmApiBooleanUnion(a, b)`.
     Union {
@@ -220,6 +240,36 @@ pub enum Step {
         #[serde(default)]
         origin: P3,
     },
+    /// `SmApiCreateSkinPrimitive`: a solid lofted through `sections` in order, each one
+    /// closed profile, of `degree` in the loft direction (1, ruled, by default), capped
+    /// at the first and last section.
+    Loft {
+        /// Body written.
+        id: String,
+        /// The sections, at least two.
+        sections: Vec<LoftSection>,
+        /// Degree in the loft direction: 1 linear, 2 quadratic, 3 cubic.
+        #[serde(default = "ruled")]
+        degree: usize,
+    },
+    /// `SmApiCreateCurveSweep`: the closed `profile` (built in `plane`, moved by
+    /// `origin`, so its plane is normal to the path's start tangent) swept along the
+    /// single `path` arc or line (in the XY plane at the world origin), capped at both
+    /// ends. The profile keeps its place relative to the path's start.
+    Sweep {
+        /// Body written.
+        id: String,
+        /// Closed loops of segments, in the plane's (u, v) coordinates.
+        profile: Vec<Seg>,
+        /// Plane of the profile (default XY).
+        #[serde(default)]
+        plane: ProfilePlane,
+        /// Where the plane's origin sits.
+        #[serde(default)]
+        origin: P3,
+        /// The path: one arc or line in the plane's (u, v) coordinates.
+        path: Seg,
+    },
     /// Reflection of `body` in the plane `normal = at`; the original is not changed, join
     /// the two with a `union` step. `SM_API` has no mirror, so this defers (see `step_rust`).
     Mirror {
@@ -258,7 +308,7 @@ pub enum Step {
     },
     /// `SmApiCreateSweepAlongPlanarPath`: the profile curves swept along the path
     /// curves, which bounds a solid when capped.
-    Sweep {
+    SweepAlongPlanarPath {
         /// Body written.
         id: String,
         /// The profile curves swept (the section).
@@ -304,7 +354,7 @@ pub enum Step {
     },
 }
 
-/// A profile or path curve of a [`Step::Sweep`], tagged by its `"curve"` kind.
+/// A profile or path curve of a [`Step::SweepAlongPlanarPath`], tagged by its `"curve"` kind.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "curve", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CurveSpec {
@@ -364,6 +414,20 @@ pub enum Seg {
     },
 }
 
+/// One section of a `loft`: a closed profile built in `plane` and moved by `origin`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoftSection {
+    /// One closed loop of segments, in the plane's (u, v) coordinates.
+    pub profile: Vec<Seg>,
+    /// Plane of the profile (default XY).
+    #[serde(default)]
+    pub plane: ProfilePlane,
+    /// Where the plane's origin sits.
+    #[serde(default)]
+    pub origin: P3,
+}
+
 /// The plane a profile is drawn in, as a right-handed rotation of XY.
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -375,6 +439,8 @@ pub enum ProfilePlane {
     Yz,
     /// u along Z, v along X, normal +Y.
     Zx,
+    /// u along X, v along Z, normal -Y (XY turned +90 degrees about X).
+    Xz,
 }
 
 /// The axis a mirror plane is perpendicular to.
@@ -458,6 +524,10 @@ fn cap_ends_default() -> i32 {
     3
 }
 
+fn ruled() -> usize {
+    1
+}
+
 /// A loaded case: `<file stem>/<name>` and its file.
 #[derive(Debug, Clone)]
 pub struct Loaded {
@@ -529,16 +599,19 @@ impl Step {
             Self::Box { id, .. }
             | Self::Sphere { id, .. }
             | Self::Cylinder { id, .. }
+            | Self::Rotate { id, .. }
             | Self::Union { id, .. }
             | Self::Difference { id, .. }
             | Self::Intersection { id, .. }
             | Self::Extrude { id, .. }
             | Self::Revolve { id, .. }
             | Self::Pipe { id, .. }
+            | Self::Loft { id, .. }
+            | Self::Sweep { id, .. }
             | Self::Mirror { id, .. }
             | Self::Fillet { id, .. }
             | Self::OffsetFaces { id, .. }
-            | Self::Sweep { id, .. }
+            | Self::SweepAlongPlanarPath { id, .. }
             | Self::SheetCorner { id, .. } => id,
         }
     }
@@ -553,12 +626,15 @@ impl Step {
             | Self::Extrude { .. }
             | Self::Revolve { .. }
             | Self::Pipe { .. }
+            | Self::Loft { .. }
+            | Self::SweepAlongPlanarPath { .. }
             | Self::SheetCorner { .. } => Vec::new(),
             Self::Union { a, b, .. }
             | Self::Difference { a, b, .. }
             | Self::Intersection { a, b, .. } => vec![a, b],
             Self::Fillet { body, .. }
             | Self::OffsetFaces { body, .. }
+            | Self::Rotate { body, .. }
             | Self::Mirror { body, .. } => vec![body],
         }
     }
@@ -630,6 +706,13 @@ fn valid_profile(profile: &[Seg]) -> bool {
         })
 }
 
+/// A sweep path has only lines and arcs (and its numbers are finite, checked by
+/// [`valid_profile`]).
+fn valid_path_segments(path: &[Seg]) -> bool {
+    path.iter()
+        .all(|s| matches!(s, Seg::Line { .. } | Seg::Arc { .. }))
+}
+
 /// Every step reads only bodies written before it, the last step writes [`RESULT`],
 /// and every number is finite.
 ///
@@ -660,6 +743,12 @@ pub fn validate(case: &Case) -> Result<(), String> {
                     && radius.is_finite()
                     && height.is_finite()
             }
+            Step::Rotate {
+                point,
+                axis,
+                degrees,
+                ..
+            } => point.iter().chain(axis).all(|x| x.is_finite()) && degrees.is_finite(),
             Step::Difference {
                 pattern: Some(p), ..
             } => p.pitch.iter().flatten().all(|x| x.is_finite()),
@@ -697,19 +786,33 @@ pub fn validate(case: &Case) -> Result<(), String> {
             } => {
                 radius.is_finite()
                     && origin.iter().all(|x| x.is_finite())
-                    && path
-                        .iter()
-                        .all(|s| matches!(s, Seg::Line { .. } | Seg::Arc { .. }))
+                    && valid_path_segments(path)
                     && valid_profile(path)
             }
+            Step::Loft { sections, .. } => {
+                sections.len() >= 2
+                    && sections.iter().all(|s| {
+                        s.origin.iter().all(|x| x.is_finite()) && valid_profile(&s.profile)
+                    })
+            }
             Step::Mirror { at, .. } => at.is_finite(),
+            Step::Sweep {
+                profile,
+                origin,
+                path,
+                ..
+            } => {
+                origin.iter().all(|x| x.is_finite())
+                    && valid_profile(profile)
+                    && valid_path_segments(std::slice::from_ref(path))
+            }
             Step::Fillet { edges, radius, .. } => {
                 edges.iter().flatten().all(|x| x.is_finite()) && radius.is_finite()
             }
             Step::OffsetFaces {
                 faces, distance, ..
             } => faces.iter().flatten().all(|x| x.is_finite()) && distance.is_finite(),
-            Step::Sweep {
+            Step::SweepAlongPlanarPath {
                 profile,
                 path,
                 cap_ends,
@@ -837,11 +940,16 @@ fn solid(e: &SolidError) -> Run {
     }
 }
 
+/// The operand `id` for the next step. A plain [`Clone`] resets every geometry owner, and
+/// a B-rep cache made from the clone then holds no edge or face, so the boolean's ray
+/// fires found nothing and classified a nested operand's faces as outside (a void was
+/// lost). `clone_standing_for_self` keeps the owners, as upstream's move does.
 fn take(bodies: &BTreeMap<String, Brep>, id: &str) -> Result<Brep, Run> {
     bodies
         .get(id)
-        .cloned()
-        .ok_or_else(|| Run::Error(format!("no body `{id}`")))
+        .ok_or_else(|| Run::Error(format!("no body `{id}`")))?
+        .clone_standing_for_self()
+        .map_err(|e| solid(&e))
 }
 
 /// `SmApiBrepCopy(b)`: a copy that owns its geometry, so a later `SmApiTranslate`
@@ -957,18 +1065,20 @@ fn profile_curves(
         }
     }
     // XY -> YZ is the turn x -> y -> z -> x: 120 degrees about (1, 1, 1); ZX is 240.
+    // XZ is XY turned 90 degrees about X, so u is x and v is z.
     let turn = match plane {
         ProfilePlane::Xy => None,
-        ProfilePlane::Yz => Some(120.0),
-        ProfilePlane::Zx => Some(240.0),
+        ProfilePlane::Yz => Some((Vec3::new(1.0, 1.0, 1.0), 120.0)),
+        ProfilePlane::Zx => Some((Vec3::new(1.0, 1.0, 1.0), 240.0)),
+        ProfilePlane::Xz => Some((Vec3::X, 90.0)),
     };
     for c in &mut out {
-        if let Some(deg) = turn {
+        if let Some((axis, deg)) = turn {
             api_rotate(
                 k,
                 Some(TransformObject::Curve(c)),
                 Vec3::new(0.0, 0.0, 0.0),
-                Vec3::new(1.0, 1.0, 1.0),
+                axis,
                 deg,
             )
             .map_err(|e| solid(&e))?;
@@ -994,6 +1104,26 @@ fn step_rust(k: &mut Kernel, bodies: &mut BTreeMap<String, Brep>, step: &Step) -
             height,
             ..
         } => cylinder(k, *origin, *axis, *radius, *height)?,
+        Step::Rotate {
+            body,
+            point,
+            axis,
+            degrees,
+            ..
+        } => {
+            // A real copy (see `copy`): a plain clone would stay put when turned.
+            let source = take(bodies, body)?;
+            let mut turned = copy(k, &source, 1000 + bodies.len() as u64)?;
+            api_rotate(
+                k,
+                Some(TransformObject::Brep(&mut turned)),
+                p3(*point),
+                Vec3::new(axis[0], axis[1], axis[2]),
+                *degrees,
+            )
+            .map_err(|e| solid(&e))?;
+            turned
+        }
         Step::Union { a, b, .. } => {
             boolean::boolean_union(k, take(bodies, a)?, take(bodies, b)?).map_err(|e| solid(&e))?
         }
@@ -1048,6 +1178,7 @@ fn step_rust(k: &mut Kernel, bodies: &mut BTreeMap<String, Brep>, step: &Step) -
                 ProfilePlane::Xy => Vec3::new(0.0, 0.0, 1.0),
                 ProfilePlane::Yz => Vec3::new(1.0, 0.0, 0.0),
                 ProfilePlane::Zx => Vec3::new(0.0, 1.0, 0.0),
+                ProfilePlane::Xz => Vec3::new(0.0, -1.0, 0.0),
             };
             sweeps::create_linear_sweep(k, &refs, normal, *distance, true).map_err(|e| solid(&e))?
         }
@@ -1097,6 +1228,7 @@ fn step_rust(k: &mut Kernel, bodies: &mut BTreeMap<String, Brep>, step: &Step) -
                     ProfilePlane::Xy => Vec3::new(u, v, 0.0),
                     ProfilePlane::Yz => Vec3::new(0.0, u, v),
                     ProfilePlane::Zx => Vec3::new(v, 0.0, u),
+                    ProfilePlane::Xz => Vec3::new(u, 0.0, v),
                 }
                 .unitize()
                 .map_err(|e| solid(&e))?;
@@ -1125,6 +1257,48 @@ fn step_rust(k: &mut Kernel, bodies: &mut BTreeMap<String, Brep>, step: &Step) -
                 sweeps::create_sweep_along_planar_path(k, &[&circle], &refs, true, 3)
                     .map_err(|e| solid(&e))?
             }
+        }
+        Step::Loft {
+            sections, degree, ..
+        } => {
+            let mut counts = Vec::new();
+            let mut cs = Vec::new();
+            for s in sections {
+                let section = profile_curves(k, &s.profile, s.plane, s.origin)?;
+                counts.push(section.len());
+                cs.extend(section);
+            }
+            let refs: Vec<Option<&Curve>> = cs.iter().map(Some).collect();
+            create_skin_primitive(k, &counts, &refs, *degree, true)
+                .map_err(|e| solid(&e))?
+                .brep
+        }
+        Step::Sweep {
+            profile,
+            plane,
+            origin,
+            path,
+            ..
+        } => {
+            let cs = profile_curves(k, profile, *plane, *origin)?;
+            // The path is one arc or line in the XY plane at the world origin (no plane
+            // turn, no translation), so the profile's plane is normal to its start tangent.
+            let path = profile_curves(k, std::slice::from_ref(path), ProfilePlane::Xy, [0.0; 3])?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Run::Error("sweep path has no curve".into()))?;
+            let refs: Vec<Option<&Curve>> = cs.iter().map(Some).collect();
+            let options = SweepOptions {
+                cap_ends: true,
+                // `SMLIB_SWEEP_FOLLOW`: the profile turns with the path's frame.
+                translational_sweep: false,
+                move_profile_center_to_path: false,
+                orient_profile_perpendicular_to_path: false,
+                move_to_profile: false,
+            };
+            sweeps::create_curve_sweep(k, &refs, Some(&path), None, None, Some(&options))
+                .map_err(|e| solid(&e))?
+                .brep
         }
         // SM_API has no mirror and no matrix transform: SmBrep::Mirror and
         // SmBrep::Transform(double[4][4]) are SMLib-level and not ported. The nearest
@@ -1156,7 +1330,7 @@ fn step_rust(k: &mut Kernel, bodies: &mut BTreeMap<String, Brep>, step: &Step) -
                 symbol: "offset of selected faces (SmApiOffsetBrepFull moves every face)".into(),
             }))
         }
-        Step::Sweep {
+        Step::SweepAlongPlanarPath {
             profile,
             path,
             move_profile,
@@ -1181,7 +1355,49 @@ fn step_rust(k: &mut Kernel, bodies: &mut BTreeMap<String, Brep>, step: &Step) -
     Ok(())
 }
 
+/// Makes the NURB of every analytic surface that the operation left without one (a
+/// boolean result's swept faces carry an `SmSurfOfExtrusion` whose base has none).
+/// Upstream's first `SmBSplineSurface::CalculateBoundingBox` makes it through the virtual
+/// `GetOrCreateGwNurbPointer`; the port's bounding box is a `const` method and returns
+/// `SM_ERR` instead, so the volume of such a body would fail here (recorded in
+/// plan/findings/query.brep--boolean-results-need-their-analytic-nurbs.md).
+fn make_missing_nurbs(k: &Kernel, b: &mut Brep) -> Result<(), SolidError> {
+    for f in b.face_list().to_vec() {
+        let Ok(face) = b.face_mut(f) else { continue };
+        let Some(surface) = face.surface.as_mut() else {
+            continue;
+        };
+        let missing = match surface.kind() {
+            SurfaceKind::Plane(s) => s.base().gw_nurb().is_none(),
+            SurfaceKind::Cone(s) => s.rev().base().gw_nurb().is_none(),
+            SurfaceKind::Sphere(s) => s.base().base().gw_nurb().is_none(),
+            SurfaceKind::Torus(s) => s.base().base().gw_nurb().is_none(),
+            SurfaceKind::SurfOfRevolution(s) => s.base().gw_nurb().is_none(),
+            SurfaceKind::SurfOfExtrusion(s) => s.base().gw_nurb().is_none(),
+            SurfaceKind::BSpline(_)
+            | SurfaceKind::CurveBounded(_)
+            | SurfaceKind::Step(_)
+            | SurfaceKind::OffsetSurface(_)
+            | SurfaceKind::SrfInVolume(_) => false,
+        };
+        if !missing {
+            continue;
+        }
+        match surface.kind_mut() {
+            SurfaceKind::Plane(s) => s.make_nurb()?,
+            SurfaceKind::Cone(s) => s.make_nurb(k)?,
+            SurfaceKind::Sphere(s) => s.make_nurb(k)?,
+            SurfaceKind::Torus(s) => s.make_nurb(k)?,
+            SurfaceKind::SurfOfRevolution(s) => s.make_nurb(k)?,
+            SurfaceKind::SurfOfExtrusion(s) => s.make_nurb(k)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn measure(k: &Kernel, b: &mut Brep) -> Result<Measured, SolidError> {
+    make_missing_nurbs(k, b)?;
     let store = AttributeStore::default();
     let attrs = PropertyAttributes {
         store: &store,
@@ -1213,9 +1429,26 @@ fn measure(k: &Kernel, b: &mut Brep) -> Result<Measured, SolidError> {
     })
 }
 
+/// Turns on the `UpstreamFixes` field `name` a case asks for.
+fn enable_fix(k: &mut Kernel, name: &str) -> Result<(), String> {
+    let field = match name {
+        "sweep_frame_on_planar_path_normal" => &mut k.fixes.sweep_frame_on_planar_path_normal,
+        "cover_refuses_folded_continuation" => &mut k.fixes.cover_refuses_folded_continuation,
+        "cone_parallel_line_midpoint" => &mut k.fixes.cone_parallel_line_midpoint,
+        _ => return Err(format!("unknown `fixes` entry `{name}`")),
+    };
+    *field = true;
+    Ok(())
+}
+
 /// Runs `case` on solidcore.
 pub fn run_rust(case: &Case) -> Run {
     let mut k = Kernel::default();
+    for fix in &case.fixes {
+        if let Err(msg) = enable_fix(&mut k, fix) {
+            return Run::Error(msg);
+        }
+    }
     let mut bodies = BTreeMap::new();
     for (n, step) in case.steps.iter().enumerate() {
         match step_rust(&mut k, &mut bodies, step) {
@@ -1467,16 +1700,39 @@ mod tests {
 
     #[test]
     fn every_case_file_loads() {
+        // No hard-coded total (every new case file would edit it and conflict): every
+        // file in the directory is a case file, and every case of every file loads.
+        let dir = cases_dir(&crate::case::repo_root());
+        let mut expected = 0;
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let p = e.unwrap().path();
+            assert_eq!(
+                p.extension().and_then(|x| x.to_str()),
+                Some("json"),
+                "{p:?}"
+            );
+            let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+            let n = v["cases"].as_array().map_or(0, Vec::len);
+            assert!(n > 0, "{p:?}: no cases");
+            expected += n;
+        }
+        // 126 cases in 28 files after the merge (counted 2026-10-26); update both
+        // numbers together when a fixture is added.
+        assert_eq!(
+            expected, 126,
+            "fixture total changed: recount fixtures/solidcraft"
+        );
         let cases = all();
         assert_eq!(
             cases.len(),
-            80,
+            expected,
             "{:?}",
             cases.iter().map(|c| &c.id).collect::<Vec<_>>()
         );
         for l in &cases {
             assert!(
                 l.id.starts_with("a52-")
+                    || l.id.starts_with("catics-")
                     || (l.file.issue.contains("/issues/") && l.file.pr.contains("/pull/")),
                 "{}",
                 l.id
@@ -1502,6 +1758,16 @@ mod tests {
             let (v, _) = verdict(&l.case.expect, &run);
             assert!(VERDICTS.contains(&v), "{}", l.id);
         }
+    }
+
+    #[test]
+    fn fixes_are_enabled_by_name() {
+        let mut k = Kernel::default();
+        enable_fix(&mut k, "sweep_frame_on_planar_path_normal").unwrap();
+        enable_fix(&mut k, "cover_refuses_folded_continuation").unwrap();
+        assert!(k.fixes.sweep_frame_on_planar_path_normal);
+        assert!(k.fixes.cover_refuses_folded_continuation);
+        assert!(enable_fix(&mut k, "no_such_fix").is_err());
     }
 
     #[test]
@@ -1695,6 +1961,7 @@ mod tests {
         let case = |steps: Vec<Step>| Case {
             name: "c".into(),
             note: None,
+            fixes: Vec::new(),
             steps,
             expect: Expect::default(),
         };
@@ -1737,10 +2004,10 @@ mod tests {
         let path = r#"{"curve": "line", "start": [0, 0, 0], "end": [0, 20, 0]}"#;
         let profile = r#"{"curve": "bezier", "points": [[0, 0, 0], [2, 2, 0], [4, 0, 0]]}"#;
         let sweep = format!(
-            r#"{{"op": "sweep", "id": "result", "profile": [{profile}], "path": [{path}]}}"#
+            r#"{{"op": "sweep_along_planar_path", "id": "result", "profile": [{profile}], "path": [{path}]}}"#
         );
         assert!(validate(&case(vec![step(&sweep)])).is_ok());
-        let Step::Sweep {
+        let Step::SweepAlongPlanarPath {
             move_profile,
             cap_ends,
             ..
@@ -1754,18 +2021,19 @@ mod tests {
         // Rejections: a cap selector outside 0..=3, an empty profile, a non-positive
         // weight and a non-finite coordinate.
         let bad_cap = format!(
-            r#"{{"op": "sweep", "id": "result", "profile": [{profile}], "path": [{path}], "cap_ends": 4}}"#
+            r#"{{"op": "sweep_along_planar_path", "id": "result", "profile": [{profile}], "path": [{path}], "cap_ends": 4}}"#
         );
         assert!(validate(&case(vec![step(&bad_cap)])).is_err());
-        let empty =
-            format!(r#"{{"op": "sweep", "id": "result", "profile": [], "path": [{path}]}}"#);
+        let empty = format!(
+            r#"{{"op": "sweep_along_planar_path", "id": "result", "profile": [], "path": [{path}]}}"#
+        );
         assert!(validate(&case(vec![step(&empty)])).is_err());
         let bad_weight = r#"{"curve": "bezier", "points": [[0, 0, 0], [1, 1, 0], [2, 0, 0]], "weights": [1, 0, 1]}"#;
         let bad_weight = format!(
-            r#"{{"op": "sweep", "id": "result", "profile": [{bad_weight}], "path": [{path}]}}"#
+            r#"{{"op": "sweep_along_planar_path", "id": "result", "profile": [{bad_weight}], "path": [{path}]}}"#
         );
         assert!(validate(&case(vec![step(&bad_weight)])).is_err());
-        let non_finite = Step::Sweep {
+        let non_finite = Step::SweepAlongPlanarPath {
             id: "result".into(),
             profile: vec![CurveSpec::Line {
                 start: [0.0, 0.0, 0.0],
@@ -1779,6 +2047,16 @@ mod tests {
             cap_ends: 3,
         };
         assert!(validate(&case(vec![non_finite])).is_err());
+
+        let loft = r#"{"op": "loft", "id": "result", "sections": [{"profile": [{"kind": "circle", "center": [0, 0], "radius": 2}]}, {"profile": [{"kind": "circle", "center": [0, 0], "radius": 1}], "origin": [0, 0, 5]}]}"#;
+        assert!(validate(&case(vec![step(loft)])).is_ok());
+        let Step::Loft { degree, .. } = step(loft) else {
+            panic!("not a loft")
+        };
+        assert_eq!(degree, 1);
+        let one = r#"{"op": "loft", "id": "result", "sections": [{"profile": [{"kind": "circle", "center": [0, 0], "radius": 2}]}]}"#;
+        assert!(validate(&case(vec![step(one)])).is_err());
+        assert!(serde_json::from_str::<Step>(&loft.replace("\"origin\"", "\"orign\"")).is_err());
     }
 
     #[test]

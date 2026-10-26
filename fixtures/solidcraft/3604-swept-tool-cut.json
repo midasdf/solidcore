@@ -9,7 +9,7 @@
    "note": "The issue's investigation found each path curve alone sweeps and cuts: here the free-form profile is swept along the 30 mm straight bottom edge alone (`l3` in the issue's script). A straight path makes the swept solid an exact ruled one, so its volume is exactly profile area * path length.",
    "steps": [
     {
-     "op": "sweep",
+     "op": "sweep_along_planar_path",
      "id": "result",
      "profile": [
       {"curve": "line", "start": [-0.2, 15, -0.2], "end": [0.8, 15, -0.2]},
@@ -49,7 +49,7 @@
    "note": "The issue's sweep tool itself: the free-form profile swept along the projected chain (the degree-5 Bezier corner spline, then the 30 mm straight edge). Its volume is not asserted: the issue measured the tool on SolidCraft's own sweep placement, while SM_API anchors the section's bounding-box centre (not its centroid) at the path start, and this asymmetric section's centroid is off the path, so the swept volume depends on the frame's in-plane orientation. That the sweep of the two-curve chain is one valid solid is asserted.",
    "steps": [
     {
-     "op": "sweep",
+     "op": "sweep_along_planar_path",
      "id": "result",
      "profile": [
       {"curve": "line", "start": [-0.2, 15, -0.2], "end": [0.8, 15, -0.2]},
@@ -101,7 +101,7 @@
      "radius": 5
     },
     {
-     "op": "sweep",
+     "op": "sweep_along_planar_path",
      "id": "tool",
      "profile": [
       {
@@ -160,7 +160,7 @@
      "radius": 5
     },
     {
-     "op": "sweep",
+     "op": "sweep_along_planar_path",
      "id": "tool",
      "profile": [
       {"curve": "line", "start": [-0.2, 15, -0.2], "end": [0.8, 15, -0.2]},

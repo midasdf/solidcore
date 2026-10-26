@@ -102,7 +102,7 @@ use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
 use crate::query::brep::{self as qbrep, BoundingBoxOptions};
 use crate::query::edge as qedge;
 use crate::query::face::p1 as qface1;
-use crate::query::face::p2::{curve_on_classify, CurveOnClassifyObjects};
+use crate::query::face::p2::{curve_on_classify_mut, CurveOnClassifyBrep};
 use crate::surface::surface::{Surface, SurfaceKind};
 use crate::surface::trim_srf_cache::TrimSrfCache;
 use crate::topology::brep::p1;
@@ -595,6 +595,22 @@ pub fn notify(
     operation: NotifyOperation,
     data: [Option<NotifyArg>; 3],
 ) -> Result<()> {
+    notify_with_body_identity(b, env, cache, operation, data, brep_ref(b))
+}
+
+/// Notify using the caller's authoritative identity for this actual body.
+/// Cache edits and region propagation share [`notify`]'s implementation.
+///
+/// # Errors
+/// The same cache and notification errors as [`notify`].
+pub fn notify_with_body_identity(
+    b: &Brep,
+    env: &mut NotifyEnv<'_>,
+    cache: Option<&mut BrepCacheSlot<'_>>,
+    operation: NotifyOperation,
+    data: [Option<NotifyArg>; 3],
+    body: ObjectRef,
+) -> Result<()> {
     use NotifyOperation as N;
     let [d1, d2, d3] = data;
     let mut slot = cache;
@@ -633,7 +649,7 @@ pub fn notify(
         &mut *env.attributes,
         env.context.as_deref_mut(),
         operation,
-        brep_ref(b),
+        body,
         r1,
         r2,
         r3,
@@ -770,6 +786,14 @@ impl ArenaNotifyState {
         all.extend(b.edges().iter().map(|(x, _)| EntityRef::Edge(x)));
         all.extend(b.vertexuses().iter().map(|(x, _)| EntityRef::Vertexuse(x)));
         all.extend(b.vertices().iter().map(|(x, _)| EntityRef::Vertex(x)));
+        if self.records.is_empty() {
+            // Bulk build (sorted input is O(n)); the same map as entry-by-entry.
+            self.records = all
+                .into_iter()
+                .map(|e| (notify_ref(e).key, Topology::default()))
+                .collect();
+            return;
+        }
         for e in all {
             self.records.entry(notify_ref(e).key).or_default();
         }
@@ -1600,7 +1624,7 @@ pub fn replace_surface(
 
     // when asked - build new UVTrimCurves
     if create_uv_trim_curves {
-        face_create_uv_trim_curves(k, b, top_face)?;
+        face_create_uv_trim_curves(k, b, env, top_face)?;
     }
 
     // all done
@@ -1860,9 +1884,15 @@ fn face_notify(
 }
 
 /// `SER(pTopFace->CreateUVTrimCurves(TRUE, NULL, NULL, ..))`
-/// ([`face3::create_uv_trim_curves`]; the gap statistics are dropped).
-fn face_create_uv_trim_curves(k: &Kernel, b: &mut Brep, f: FaceId) -> Result<()> {
-    face3::create_uv_trim_curves(k, b, f, true, None).map(|_| ())
+/// ([`face3::create_uv_trim_curves_notified`]: its UV trim curve edits notify through
+/// `env`; the gap statistics are dropped).
+fn face_create_uv_trim_curves(
+    k: &Kernel,
+    b: &mut Brep,
+    env: &mut NotifyEnv<'_>,
+    f: FaceId,
+) -> Result<()> {
+    face3::create_uv_trim_curves_notified(k, b, f, true, None, Some(env)).map(|_| ())
 }
 
 /// `pRegion->PostInsert(pShell)`: the new shell goes to the tail of the region's shell
@@ -1938,10 +1968,8 @@ fn shell_transfer_children(k: &mut Kernel, b: &mut Brep, from: ShellId, to: Shel
 /// [`MergeIntervalBrep`]: the adapter holds the B-rep the curves merge into, which
 /// upstream's `MergeIntervals` edits through the classification's topology pointers.
 pub trait MergeCurvesObjects<O: ClassObject>:
-    CurveOnClassifyObjects<O> + MergeIntervalBrep<O>
+    CurveOnClassifyBrep<O> + MergeIntervalBrep<O>
 {
-    /// The B-rep the curves merge into (`this`).
-    fn brep(&self) -> &Brep;
     /// The edge behind an edge handle (an interval's `m_vMid.GetObject()`).
     fn edge_of(&self, object: O) -> Option<EdgeId>;
     /// The face behind a face handle (a new face of `MergeIntervals`).
@@ -1985,8 +2013,8 @@ pub struct MergedCurves {
 /// `uv_curves`, used on the first face only) lying on the surface of `face` into the
 /// face, splitting it (and the faces split off it) into new faces. Curves shorter than
 /// `tolerance` are skipped. Each curve is classified against each face
-/// ([`curve_on_classify`]), coincident-maybe intervals are squeezed, the intervals are
-/// merged into the B-rep `objects` holds ([`MergeCurvesObjects::brep`], edited through
+/// in place ([`curve_on_classify_mut`]), coincident-maybe intervals are squeezed, the
+/// intervals are merged into the B-rep `objects` holds ([`crate::query::face::p2::FaceBrep::brep`], edited through
 /// [`MergeIntervalBrep`]; a failed merge is ignored, as upstream \[B674\]) and the edges
 /// the curve classifies to are collected. The context's `DoingBoolean` flag is set for
 /// the duration.
@@ -2067,12 +2095,10 @@ fn merge_curves_body<O: ClassObject + Copy>(
             cc.set_intersect_data(surface, options.intersection_surface, None, true, None);
 
             // classify the curve against the surface->Face
-            let objs = &*objects;
-            let _modified = curve_on_classify(
+            let _modified = curve_on_classify_mut(
                 k,
-                objs.brep(),
                 f,
-                objs,
+                objects,
                 true,
                 &mut cc,
                 options.use_projection,

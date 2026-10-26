@@ -9,10 +9,11 @@
 //! cargo run -p difftest --features cpp -- --status-of <id>   # prints green|partial|fail
 //! options: --seeds N (default 16)  --filter <substr>  --perturb  --report-dir <dir>  --no-report
 //!          --baseline <dir>   # regression ratchet against earlier reports (see `difftest::baseline`)
+//!          --run-parked       # only the parked cases (`cpp_defect` entries); nightly, never the gate
 //!          --jobs N (-j; default 1, 0 = all cores)   # units in N child processes (`difftest::jobs`)
 //! cargo run -p difftest --features cpp -- --unit <id> --fuzz N [--fuzz-out <dir>]   # FFI guard probing
 //! cargo run -p difftest --features cpp -- --ssi-corpus [--tol 1e-6|default] [--jobs N] [glob]
-//! cargo run -p difftest -- --ssi-corpus [glob]   # the `ssi` engine only; no `cpp` feature needed
+//! cargo run -p difftest -- --ssi-corpus [glob]   # the `ssi` and `solidcore-ssi` engines; no `cpp` needed
 //! cargo run -p difftest -- --solidcraft-cases [glob]   # Rust only; no `cpp` feature needed
 //! cargo run -p difftest --features cpp -- --green --digest-dir <dir> [--digest-debug]   # Rust side
 //!          only, one `<dir>/<unit>.digest` per unit (native vs wasm32: scripts/wasm-digest.sh)
@@ -29,11 +30,12 @@ use difftest::case::repo_root;
 use difftest::{fuzz, plan, registry, report, run_unit, CaseContext, RunOptions, UnitStatus};
 
 const USAGE: &str = "usage: difftest [--unit <id>]... [--green] [--all] [--list]
-       [--status-of <id>] [--seeds N] [--filter <substr>] [--perturb] [--report-dir <dir>] [--no-report] [--jobs N]
+       [--status-of <id>] [--seeds N] [--filter <substr>] [--perturb] [--run-parked] [--report-dir <dir>] [--no-report] [--jobs N]
        [--baseline <dir>] [--compare-reports <dir>] [--digest-dir <dir> [--digest-debug]]
        difftest --unit <id>... --fuzz N [--fuzz-out <dir>] [--seeds N] [--filter <substr>]
        difftest --ssi-corpus [--tol 1e-6|default] [--jobs N] [--report-dir <dir>] [--no-report] [case-glob]
-       difftest --solidcraft-cases [--report-dir <dir>] [--no-report] [case-glob]";
+       difftest --solidcraft-cases [--report-dir <dir>] [--no-report] [case-glob]
+       difftest --step-corpus [--jobs N] [--report-dir <dir>] [--no-report] [file-glob]";
 
 /// Default child processes of `--ssi-corpus`.
 const DEFAULT_SSI_JOBS: usize = 2;
@@ -59,12 +61,14 @@ struct Args {
     seeds: Option<usize>,
     filter: Option<String>,
     perturb: bool,
+    run_parked: bool,
     report_dir: Option<PathBuf>,
     no_report: bool,
     baseline: Option<PathBuf>,
     compare_reports: Option<PathBuf>,
     ssi_corpus: bool,
     solidcraft_cases: bool,
+    step_corpus: bool,
     tol: Option<String>,
     jobs: Option<usize>,
     glob: Option<String>,
@@ -92,6 +96,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--filter" => a.filter = Some(val("--filter")?),
             "--perturb" => a.perturb = true,
+            "--run-parked" => a.run_parked = true,
             "--report-dir" => a.report_dir = Some(PathBuf::from(val("--report-dir")?)),
             "--no-report" => a.no_report = true,
             "--baseline" => a.baseline = Some(PathBuf::from(val("--baseline")?)),
@@ -100,6 +105,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--ssi-corpus" => a.ssi_corpus = true,
             "--solidcraft-cases" => a.solidcraft_cases = true,
+            "--step-corpus" => a.step_corpus = true,
             "--tol" => a.tol = Some(val("--tol")?),
             "--jobs" | "-j" => {
                 let v = val("--jobs")?;
@@ -118,7 +124,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "-h" | "--help" => return Err(String::new()),
             other
-                if (a.ssi_corpus || a.solidcraft_cases)
+                if (a.ssi_corpus || a.solidcraft_cases || a.step_corpus)
                     && !other.starts_with('-')
                     && a.glob.is_none() =>
             {
@@ -138,6 +144,10 @@ fn main() -> ExitCode {
     }
     if raw.first().map(String::as_str) == Some("--ssi-case") {
         return difftest::ssi::run_child(raw.get(1..).unwrap_or(&[]));
+    }
+    // Child of `--step-corpus`: one kernel on one body (see `difftest::step::run_child`).
+    if raw.first().map(String::as_str) == Some("--step-case") {
+        return difftest::step::run_child(raw.get(1..).unwrap_or(&[]));
     }
     // Child of `--fuzz`: one batch of fuzz cases (see `difftest::fuzz::run_child`).
     if raw.first().map(String::as_str) == Some("--fuzz-exec") {
@@ -169,10 +179,22 @@ fn main() -> ExitCode {
             || args.digest_dir.is_some()
             || args.fuzz.is_some()
             || args.ssi_corpus
-            || args.solidcraft_cases)
+            || args.solidcraft_cases
+            || args.step_corpus)
     {
         eprintln!("difftest: --baseline requires an unfiltered comparison run");
         return ExitCode::from(2);
+    }
+
+    // Without the C++ kernel it builds the Rust side alone.
+    if args.step_corpus {
+        let opts = difftest::step::CorpusOptions {
+            glob: args.glob.clone(),
+            jobs: args.jobs.unwrap_or(DEFAULT_SSI_JOBS).max(1),
+            report_dir: args.report_dir.clone(),
+            no_report: args.no_report,
+        };
+        return difftest::step::run_corpus(&root, &opts);
     }
 
     if args.solidcraft_cases {
@@ -263,13 +285,12 @@ fn main() -> ExitCode {
                     filter: args.filter.clone(),
                     perturb: false,
                     case_timeout: args.case_timeout.map(std::time::Duration::from_secs),
+                    run_parked: false,
                 };
                 let res = run_unit(unit.as_ref(), &ctx, &opts);
                 // The value-share floor is part of the gate (`--green` enforces it too).
                 match baseline::value_share(&res) {
-                    Some(v)
-                        if res.status() != UnitStatus::Fail && waivers.covering(&v).is_none() =>
-                    {
+                    Some(v) if res.pass() && waivers.covering(&v).is_none() => {
                         eprintln!("difftest: {id}: {}", v.detail);
                         UnitStatus::Fail
                     }
@@ -365,6 +386,7 @@ fn main() -> ExitCode {
         filter: args.filter.clone(),
         perturb: args.perturb,
         case_timeout: args.case_timeout.map(std::time::Duration::from_secs),
+        run_parked: args.run_parked,
     };
     let report_dir = args
         .report_dir
@@ -395,6 +417,7 @@ fn main() -> ExitCode {
 
     let mut failed = 0usize;
     let mut partial = 0usize;
+    let mut skipped = 0usize;
     for id in &wanted {
         let Some(unit) = reg.iter().find(|u| u.id() == id.as_str()) else {
             println!("FAIL {id} (no difftest runner registered for this unit)");
@@ -402,7 +425,7 @@ fn main() -> ExitCode {
             continue;
         };
         let res = run_unit(unit.as_ref(), &ctx, &opts);
-        if args.perturb {
+        if args.perturb && res.status() != UnitStatus::SkippedPlatform {
             let (n, caught) = res.perturb_stats();
             let ok = n > 0 && n == caught;
             let unperturbed = res
@@ -466,22 +489,38 @@ fn main() -> ExitCode {
                 c.source.describe()
             );
         }
+        for c in res.cases.iter().filter(|c| c.is_parked()) {
+            println!(
+                "  parked {} ({}) [{}]",
+                c.name,
+                c.cpp_defect.as_deref().unwrap_or_default(),
+                c.source.describe()
+            );
+        }
+        for c in res.cases.iter().filter(|c| c.is_cpp_defect()) {
+            let first = c
+                .diff
+                .mismatches
+                .first()
+                .map(|m| format!("{}: cpp={} rust={}", m.field, m.cpp, m.rust))
+                .unwrap_or_default();
+            println!(
+                "  cpp-defect {} ({}) [{}]: {first}",
+                c.name,
+                c.cpp_defect.as_deref().unwrap_or_default(),
+                c.source.describe()
+            );
+        }
         let plan_status = plan_units
             .iter()
             .find(|p| p.id == id.as_str())
             .map(|p| p.status.as_str());
-        let mut unit_failed = match res.status() {
-            UnitStatus::Fail => true,
-            UnitStatus::Partial if plan_status == Some("green") => {
-                // Green units cannot contain deferred or known mismatches.
-                println!(
-                    "  FAIL {id}: plan status is green but cases are deferred or known mismatches"
-                );
-                true
-            }
-            UnitStatus::Partial | UnitStatus::Green => false,
-        };
-        if !unit_failed {
+        let gate_error = selection_gate(res.status(), plan_status, args.baseline.is_some());
+        if let Some(reason) = gate_error {
+            println!("  FAIL {id}: {reason}");
+        }
+        let mut unit_failed = res.status() == UnitStatus::Fail || gate_error.is_some();
+        if !unit_failed && res.status() != UnitStatus::SkippedPlatform {
             let mut violations: Vec<Violation> = baseline::value_share(&res).into_iter().collect();
             if let (Some(dir), None) = (&args.baseline, &args.filter) {
                 match baseline::load_baseline(dir, id) {
@@ -499,8 +538,10 @@ fn main() -> ExitCode {
             failed += 1;
         } else if res.status() == UnitStatus::Partial {
             partial += 1;
+        } else if res.status() == UnitStatus::SkippedPlatform {
+            skipped += 1;
         }
-        if !args.no_report {
+        if !args.no_report && !args.perturb {
             match report::write_unit_report(&report_dir, &res) {
                 Ok(p) => println!(
                     "  report: {}",
@@ -519,9 +560,8 @@ fn main() -> ExitCode {
         String::new()
     };
     println!(
-        "difftest: {} unit(s), {} passed, {partial} partial, {failed} failed{dropped_note}",
-        wanted.len(),
-        wanted.len() - failed - partial
+        "{}{dropped_note}",
+        report::run_summary(wanted.len(), partial, failed, skipped)
     );
     if setup_error {
         ExitCode::from(2)
@@ -529,6 +569,24 @@ fn main() -> ExitCode {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Selection constraints are not case-level waivers. An unsupported oracle cannot
+/// satisfy an exact-base run, including when that baseline has no earlier unit report.
+fn selection_gate(
+    status: UnitStatus,
+    plan_status: Option<&str>,
+    has_baseline: bool,
+) -> Option<&'static str> {
+    match status {
+        UnitStatus::Partial if plan_status == Some("green") => {
+            Some("plan status is green but cases are deferred or known mismatches")
+        }
+        UnitStatus::SkippedPlatform if has_baseline => {
+            Some("skipped reference cannot validate an exact-base comparison")
+        }
+        _ => None,
     }
 }
 
@@ -724,6 +782,7 @@ fn fuzz_main(args: &Args, ctx: &CaseContext, root: &Path) -> ExitCode {
     let mut seen = std::collections::BTreeSet::new();
     wanted.retain(|w| seen.insert(w.clone()));
     let mut failed = 0usize;
+    let mut skipped = 0usize;
     for id in &wanted {
         let Some(unit) = reg.iter().find(|u| u.id() == id.as_str()) else {
             println!("FUZZ-FAIL {id} (no difftest runner registered for this unit)");
@@ -732,6 +791,10 @@ fn fuzz_main(args: &Args, ctx: &CaseContext, root: &Path) -> ExitCode {
         };
         let res = fuzz::run_fuzz(unit.as_ref(), ctx, &opts);
         println!("{}", fuzz::summary_line(&res));
+        if res.skipped_platform.is_some() {
+            skipped += 1;
+            continue;
+        }
         for f in res.failures.iter().take(MAX_FUZZ_LINES) {
             let file = f.file.as_deref().map_or_else(String::new, |p| {
                 format!(" -> {}", p.strip_prefix(root).unwrap_or(p).display())
@@ -757,8 +820,13 @@ fn fuzz_main(args: &Args, ctx: &CaseContext, root: &Path) -> ExitCode {
             failed += 1;
         }
     }
+    let skipped_note = if skipped > 0 {
+        format!(", {skipped} skipped(platform)")
+    } else {
+        String::new()
+    };
     println!(
-        "difftest --fuzz: {} unit(s), {failed} failed, {:.1} s",
+        "difftest --fuzz: {} unit(s), {failed} failed, {:.1} s{skipped_note}",
         wanted.len(),
         start.elapsed().as_secs_f64()
     );
@@ -766,5 +834,23 @@ fn fuzz_main(args: &Args, ctx: &CaseContext, root: &Path) -> ExitCode {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_skips_are_not_exact_base_comparisons() {
+        for plan in [None, Some("green"), Some("partial")] {
+            assert!(selection_gate(UnitStatus::SkippedPlatform, plan, false).is_none());
+            assert!(selection_gate(UnitStatus::SkippedPlatform, plan, true).is_some());
+            assert!(selection_gate(UnitStatus::Green, plan, true).is_none());
+        }
+        // A real deferral in a green unit must still fail, on every platform.
+        assert!(selection_gate(UnitStatus::Partial, Some("green"), false).is_some());
+        assert!(selection_gate(UnitStatus::Partial, Some("green"), true).is_some());
+        assert!(selection_gate(UnitStatus::Partial, Some("partial"), true).is_none());
     }
 }

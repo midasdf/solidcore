@@ -55,6 +55,9 @@
 //! Positive B-rep tolerances avoid the unported automatic `SetTolerance` path;
 //! member approximation tolerance still covers zero, negative and -1 sentinel.
 //! All numeric keys have ZERO absolute floor; signed-zero inputs are retained.
+//! A fixture case whose native vertex positions follow heap addresses (upstream
+//! `SmRelation` walks in address-hash order) sets `heap_ordered_vertices`, which omits
+//! only the result B-reps' vertex bounds on both sides; see [`Inputs::heap_ordered_vertices`].
 //!
 //! This unit is necessarily PARTIAL: current positive geometry operations reach
 //! genuine missing manifold/copy/face-construction/shrink/merge/stitch work.
@@ -275,6 +278,7 @@ impl Config {
         ShellOptions {
             offset: self.offset(),
             create_offset_solid: self.create_offset_solid,
+            merge_sheet_side_walls: false,
         }
     }
 }
@@ -291,6 +295,15 @@ struct Inputs {
     tolerance: f64,
     #[serde(default)]
     config: Config,
+    /// The returned/retained B-reps' vertex bounds are not compared (counts, kinds and
+    /// tolerance still are). Set only on fixture cases whose native vertex positions
+    /// depend on heap addresses: `DoSolidOffset` walks `SmRelation`s whose
+    /// `std::unordered_map` buckets are keyed by object address, so the order of the
+    /// tolerance-merge averaging of degenerate side-wall vertices follows the heap
+    /// layout of the process (finding
+    /// `plan/findings/offset.offset_executive_p2--exact-2tol-shell-heap-layout.md`).
+    #[serde(default)]
+    heap_ordered_vertices: bool,
 }
 impl Inputs {
     fn native(&self) -> ffi::Request {
@@ -672,17 +685,6 @@ fn build(kernel: &mut Kernel, fixture: &Fixture, tolerance: f64, namespace: u64)
                 &mut fenv,
             )
             .map_err(setup)?;
-            // the shim's representable_topology(result, 1, 1, 4, 8, 4)
-            if [
-                brep.faces().len(),
-                brep.loops().len(),
-                brep.edges().len(),
-                brep.edgeuses().len(),
-                brep.vertices().len(),
-            ] != [1, 1, 4, 8, 4]
-            {
-                return Err(bad("sheet constructor did not build a single rectangular face"));
-            }
         }
         Fixture::Box { .. } => return Err(bad("box fixtures use the primitive constructor")),
     }
@@ -705,9 +707,6 @@ fn build_box(
     let [dx, dy, dz] = size;
     let mut brep = solidcore::primitive::api_primitives::create_box(kernel, v3(origin), dx, dy, dz)
         .map_err(setup)?;
-    if brep.faces().len() != 6 || brep.edges().len() != 12 || brep.vertices().len() != 8 {
-        return Err(bad("box constructor did not build a closed box"));
-    }
     brep.set_tolerance(tolerance);
     Ok(brep)
 }
@@ -1224,10 +1223,20 @@ fn rust_result_projection(brep: &Brep) -> HResult<ResultProjection> {
         values,
     })
 }
-fn project_result(output: Output, key: &str, projection: Option<ResultProjection>) -> Output {
-    let Some(projection) = projection else {
+/// Emits a result projection; with `heap_ordered` (see [`Inputs::heap_ordered_vertices`])
+/// only the B-rep tolerance of `values` is kept, not the vertex bounds.
+fn project_result(
+    output: Output,
+    key: &str,
+    projection: Option<ResultProjection>,
+    heap_ordered: bool,
+) -> Output {
+    let Some(mut projection) = projection else {
         return output.int(&format!("{key}.present"), 0);
     };
+    if heap_ordered {
+        projection.values.truncate(1);
+    }
     output
         .int(&format!("{key}.present"), 1)
         .ints(&format!("{key}.counts"), projection.counts)
@@ -1388,7 +1397,7 @@ fn native_output(input: &Inputs, snapshot: &ffi::Snapshot) -> HResult<Output> {
             .as_ref()
             .map(|block| decode_block(block).map(|decoded| native_result_projection(&decoded)))
             .transpose()?;
-        output = project_result(output, key, projection);
+        output = project_result(output, key, projection, input.heap_ordered_vertices);
     }
     Ok(output)
 }
@@ -1796,8 +1805,9 @@ fn rust_output(input: &Inputs) -> RResult<Output> {
         vec![i64::from(source_pure), i64::from(foreign_pure)],
     )
 ;
-    output = project_result(output, "result", result_projection);
-    output = project_result(output, "executive_offset", offset_projection);
+    let heap_ordered = input.heap_ordered_vertices;
+    output = project_result(output, "result", result_projection, heap_ordered);
+    output = project_result(output, "executive_offset", offset_projection, heap_ordered);
     for (key, projection) in [
         ("source.before", source_before),
         ("source.after", source_after),
@@ -1904,6 +1914,7 @@ fn generated(rng: &mut Rng) -> Inputs {
             create_offset_solid: flags & 8 != 0,
             skip_stitch_merge: flags & 16 != 0,
         },
+        heap_ordered_vertices: false,
     };
     match category {
         0 | 1 => {
@@ -2021,6 +2032,7 @@ mod tests {
             faces: Vec::new(),
             tolerance: 1e-6,
             config: Config::default(),
+            heap_ordered_vertices: false,
         }
     }
     fn case(input: &Inputs) -> Case {
@@ -2604,16 +2616,11 @@ mod tests {
         let mut input = input(Operation::ApiShell);
         input.source = Some(box_fixture);
         input.faces = vec![Selection::Source(0), Selection::Source(0)];
-        assert_eq!(
-            Runner
-                .run_rust(&case(&input))
-                .unwrap()
-                .deferred
-                .unwrap()
-                .symbol,
-            // the working copy is made; the box shell stops at a later dependency
-            "TrimSrfCache::build_tree_with_face for a face-owned surface"
-        );
+        // the working copy is made and the shell completes: its faces' surfaces reach
+        // their faces' trimmed caches
+        let output = Runner.run_rust(&case(&input)).unwrap();
+        assert!(output.deferred.is_none());
+        assert_eq!(output.ints.get("result.present"), Some(&vec![1]));
     }
 
     #[test]
@@ -2657,7 +2664,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_native_boxes_are_rejected_without_hiding_valid_selection_errors() {
+    fn empty_native_boxes_are_compared_unless_a_face_is_selected() {
         let context = CaseContext {
             root: repo_root(),
             seeds: 0,
@@ -2680,16 +2687,28 @@ mod tests {
                     assert!(!output.values.is_empty());
                 }
                 compared += 1;
-            } else {
+            } else if case.name.ends_with("_selected") {
+                // The tiny box is an empty B-rep: no face 0 to select.
                 assert_eq!(
                     cpp.rejected.as_deref(),
                     Some("native fixture constructor status_1001")
                 );
                 assert!(cpp.ints.is_empty() && cpp.values.is_empty());
                 rejected += 1;
+            } else {
+                // Null selection: the empty box is built and the API status
+                // (1007) is compared against Rust.
+                let rust = Runner.run_rust(&case).unwrap();
+                for output in [&cpp, &rust] {
+                    assert!(output.rejected.is_none() && output.error.is_none());
+                    assert_eq!(output.ints["status"], [1007]);
+                }
+                let comparison = crate::compare::compare(&cpp, &rust, Runner.abs_floors());
+                assert!(comparison.pass(), "{}: {comparison:?}", case.name);
+                compared += 1;
             }
         }
-        assert_eq!((rejected, compared), (8, 2));
+        assert_eq!((rejected, compared), (4, 6));
     }
 
     fn assert_native_constructor_control(case: &Case, cpp: &Output, counts: [i64; 5]) {
@@ -2727,12 +2746,12 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_native_sheets_are_rejected_without_hiding_valid_controls() {
+    fn degenerate_native_sheets_are_compared_alongside_valid_controls() {
         let context = CaseContext {
             root: repo_root(),
             seeds: 0,
         };
-        let (mut rejected, mut compared) = (0, 0);
+        let (rejected, mut compared) = (0, 0);
         for case in context.fixture_cases(Runner.id()).unwrap() {
             if !case.name.starts_with("review_sheet_") {
                 continue;
@@ -2743,15 +2762,17 @@ mod tests {
                 assert_native_constructor_control(&case, &cpp, [1, 1, 4, 8, 4]);
                 compared += 1;
             } else {
-                assert_eq!(
-                    cpp.rejected.as_deref(),
-                    Some("native fixture constructor status_1001")
-                );
-                assert!(cpp.ints.is_empty() && cpp.values.is_empty());
-                rejected += 1;
+                // Merged/dropped-face sheets are defined native results, built
+                // and compared as is (not rejections).
+                let rust = Runner.run_rust(&case).unwrap();
+                assert!(cpp.rejected.is_none() && rust.rejected.is_none());
+                let comparison = crate::compare::compare(&cpp, &rust, Runner.abs_floors());
+                assert!(comparison.pass(), "{}: {comparison:?}", case.name);
+                assert!(comparison.exact_compared > 0);
+                compared += 1;
             }
         }
-        assert_eq!((rejected, compared), (9, 4));
+        assert_eq!((rejected, compared), (0, 13));
     }
 
     #[test]

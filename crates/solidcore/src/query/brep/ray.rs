@@ -16,7 +16,7 @@
 
 mod live;
 pub(crate) use live::{solve_mutable_brep_point, solve_mutable_ray};
-pub use live::{BrepFaceServices, LiveBrepObjects, SideObject, SidedFaceServices};
+pub use live::{BrepFaceServices, FaceCaches, LiveBrepObjects, SideObject, SidedFaceServices};
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -283,6 +283,13 @@ impl FaceQueries<CacheObject> for RaySurfaceContext<'_> {
         src_tol: f64,
     ) -> Result<(i32, Option<CacheObject>)> {
         self.classify(k, face, uv, src_tol, true)
+    }
+
+    fn curve_edge_tolerance(&self, curve: CacheObject) -> Option<Result<f64>> {
+        let (CacheObject::Curve(edge) | CacheObject::Edge(edge)) = curve else {
+            return None;
+        };
+        Some(crate::topology::edge::tolerance(self.brep, edge))
     }
 }
 
